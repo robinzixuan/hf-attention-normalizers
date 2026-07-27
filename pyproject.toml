@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hf-attention-normalizers"
+version = "0.1.0"
+description = "Alternative attention normalizers for HuggingFace Transformers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Softmax1 Attention Normalizers" }
+]
+keywords = [
+  "attention",
+  "transformers",
+  "huggingface",
+  "softmax1",
+  "sparsemax",
+  "entmax",
+]
+dependencies = [
+  "torch",
+  "transformers",
+]
+
+[project.optional-dependencies]
+flash-softmax-n = [
+  "flash-attention-softmax-n",
+]
+triton = [
+  "triton",
+]
+all = [
+  "flash-attention-softmax-n",
+  "triton",
+]
+
+[tool.setuptools.packages.find]
+include = ["hf_attention_normalizers*"]
