@@ -105,7 +105,7 @@ if triton is not None:
             rng_offsets = (
                 ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
             )
-            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            keep = tl.rand(tl.load(seed), rng_offsets) >= dropout_p
             dropout_scale = 1.0 / (1.0 - dropout_p)
             dropped_exponentials = exponentials * keep.to(tl.float32) * dropout_scale
             values = tl.load(
@@ -250,7 +250,7 @@ if triton is not None:
             rng_offsets = (
                 ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
             )
-            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            keep = tl.rand(tl.load(seed), rng_offsets) >= dropout_p
             dropout_scale = 1.0 / (1.0 - dropout_p)
             grad_probabilities = tl.sum(values * grad_out[None, :], axis=1)
             grad_probabilities *= keep.to(tl.float32) * dropout_scale
@@ -280,7 +280,7 @@ if triton is not None:
             rng_offsets = (
                 ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
             )
-            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            keep = tl.rand(tl.load(seed), rng_offsets) >= dropout_p
             dropout_scale = 1.0 / (1.0 - dropout_p)
             grad_probabilities = tl.sum(values * grad_out[None, :], axis=1)
             grad_probabilities *= keep.to(tl.float32) * dropout_scale
@@ -434,7 +434,11 @@ def hopper_softmax1_attention(
     # This consumes one value from PyTorch's CUDA RNG. Re-seeding PyTorch before
     # a call therefore reproduces the fused mask; backward recomputes it from
     # this saved seed instead of retaining a dense [B,H,Q,K] mask.
-    seed = int(torch.empty((), device=query.device, dtype=torch.int64).random_(2**31 - 1).item())
+    seed = torch.empty((), device=query.device, dtype=torch.int64)
+    if dropout_p:
+        seed.random_(2**31 - 1)
+    else:
+        seed.zero_()
     return _Softmax1HopperAttention.apply(
         query,
         key,

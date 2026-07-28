@@ -701,6 +701,76 @@ def hopper_softmax1_attention_forward(
     return output.transpose(1, 2).contiguous(), None
 
 
+def paged_normalizer_attention_forward(
+    module: torch.nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    cache=None,
+    cu_seq_lens_q: Optional[torch.Tensor] = None,
+    cu_seq_lens_k=None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k=None,
+    implementation=None,
+    softmax_fn: Callable[..., torch.Tensor] = softmax_1,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """HuggingFace ``paged_attention`` interface for custom normalizers.
+
+    Transformers continuous batching supplies packed Q plus cumulative lengths.
+    Its cache owns physical-page allocation and returns the logical packed K/V
+    view after update; the custom varlen kernel then performs one grid over the
+    entire continuous batch.  This is intentionally separate from
+    :func:`paged_triton_attention`, whose public API operates directly on a
+    physical block table and supports cache-page gradients.
+    """
+    if attention_mask is not None:
+        raise NotImplementedError(
+            "Custom paged_attention supports continuous-batching cumulative-length masks; "
+            "arbitrary attention_mask is not supported."
+        )
+    if cache is not None:
+        k, v = cache.update(k, v, module.layer_idx, **kwargs)
+    if isinstance(cu_seq_lens_k, dict):
+        layer_type = "sliding_attention" if getattr(module, "sliding_window", None) else "full_attention"
+        cu_seq_lens_k = cu_seq_lens_k[layer_type]
+        max_seqlen_k = max_seqlen_k[layer_type]
+    if cu_seq_lens_q is None or cu_seq_lens_k is None or max_seqlen_q is None or max_seqlen_k is None:
+        raise ValueError("paged_attention requires cu_seq_lens_q/k and max_seqlen_q/k.")
+    if q.ndim != 4:
+        raise ValueError("paged_attention query must have shape [1, heads, total_q, head_dim].")
+    packed_query = q.transpose(1, 2).squeeze(0).contiguous()
+    if k.ndim == 4:
+        packed_key = k.transpose(1, 2).squeeze(0).contiguous()
+        packed_value = v.transpose(1, 2).squeeze(0).contiguous()
+    else:
+        packed_key, packed_value = k.contiguous(), v.contiguous()
+    if softmax_fn is softmax_1:
+        normalizer = "softmax1"
+    elif softmax_fn is sparsemax:
+        normalizer = "sparsemax"
+    elif softmax_fn is entmax15:
+        normalizer = "entmax15"
+    else:
+        raise ValueError("paged_attention supports softmax1, sparsemax, or entmax15.")
+    from .varlen import varlen_hopper_attention
+
+    output = varlen_hopper_attention(
+        packed_query,
+        packed_key,
+        packed_value,
+        cu_seq_lens_q.to(torch.int32),
+        cu_seq_lens_k.to(torch.int32),
+        normalizer=normalizer,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        scale=getattr(module, "scaling", None),
+        is_causal=True,
+    )
+    return output, None
+
+
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -737,6 +807,7 @@ CUSTOM_ATTENTION_FUNCTIONS: dict[str, Callable[..., tuple[torch.Tensor, Optional
     "softmaxn_sdpa": sdpa_attention_forward,
     "softmaxn_flash_attention_2": flash_attention_softmax_n_forward,
     "flex_attention": flex_attention_normalizer_forward,
+    "paged_attention": paged_normalizer_attention_forward,
     "sparsemax_flash_attention_3": hopper_sparsemax_attention_forward,
     "entmax15_flash_attention_3": hopper_entmax15_attention_forward,
     "softmax1_flash_attention_3": hopper_softmax1_attention_forward,
@@ -749,6 +820,7 @@ HF_ATTENTION_BACKENDS = (
     "flash_attention_2",
     "flash_attention_3",
     "flex_attention",
+    "paged_attention",
     "paged|eager",
     "paged|sdpa",
     "paged|flash_attention_2",
@@ -775,6 +847,8 @@ def _make_softmax_attention_forward(
         attention_forward = flash_attention_softmax_n_forward
     elif base_backend == "flex_attention":
         attention_forward = flex_attention_normalizer_forward
+    elif base_backend == "paged_attention" and softmax_name in {"softmax1", "softmax_1", "sparsemax", "entmax15"}:
+        attention_forward = paged_normalizer_attention_forward
     elif base_backend == "flash_attention_3" and softmax_name == "sparsemax":
         attention_forward = hopper_sparsemax_attention_forward
     elif base_backend == "flash_attention_3" and softmax_name == "entmax15":
@@ -850,7 +924,7 @@ def register_softmax_attention_backends(
             backend == "flash_attention_3"
             and softmax_name_for_support in {"softmax1", "softmax_1", "softmax_n", "sparsemax", "entmax15"}
         )
-        supported = backend in {"eager", "sdpa", "flex_attention"} or supports_hopper_kernel or (
+        supported = backend in {"eager", "sdpa", "flex_attention", "paged_attention"} or supports_hopper_kernel or (
             backend == "flash_attention_2" and supports_softmax_n_kernel
         )
         if not supported and not include_unsupported:

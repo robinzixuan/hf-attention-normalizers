@@ -141,7 +141,7 @@ if triton is not None:
             rng_offsets = (
                 ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
             )
-            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            keep = tl.rand(tl.load(seed), rng_offsets) >= dropout_p
             probabilities = probabilities * keep.to(tl.float32) * (1.0 / (1.0 - dropout_p))
             values = tl.load(
                 v_ptr + offs_n[:, None] * stride_vs + offs_d[None, :] * stride_vd,
@@ -259,7 +259,7 @@ if triton is not None:
             rng_offsets = (
                 ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
             )
-            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            keep = tl.rand(tl.load(seed), rng_offsets) >= dropout_p
             grad_probabilities = tl.sum(values * do[None, :], axis=1)
             grad_probabilities *= keep.to(tl.float32) * (1.0 / (1.0 - dropout_p))
             inverse_hessian = (positive > 0.0).to(tl.float32) if mode == 0 else positive
@@ -291,7 +291,7 @@ if triton is not None:
             rng_offsets = (
                 ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
             )
-            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            keep = tl.rand(tl.load(seed), rng_offsets) >= dropout_p
             dropout_scale = 1.0 / (1.0 - dropout_p)
             grad_probabilities = tl.sum(values * do[None, :], axis=1)
             grad_probabilities *= keep.to(tl.float32) * dropout_scale
@@ -449,7 +449,11 @@ def _multi_block_attention(
     if not 0.0 <= dropout_p < 1.0:
         raise ValueError("dropout_p must be in [0, 1).")
     actual_scale = query.shape[-1] ** -0.5 if scale is None else scale
-    seed = int(torch.empty((), device=query.device, dtype=torch.int64).random_(2**31 - 1).item())
+    seed = torch.empty((), device=query.device, dtype=torch.int64)
+    if dropout_p:
+        seed.random_(2**31 - 1)
+    else:
+        seed.zero_()
     return _MultiBlockSparseAttention.apply(
         query,
         key,

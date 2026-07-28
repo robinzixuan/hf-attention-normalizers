@@ -247,6 +247,14 @@ output = paged_triton_attention(
 )
 ```
 
+The three normalizers also register HuggingFace continuous-batching backends
+(`softmax1_paged_attention`, `sparsemax_paged_attention`, and
+`entmax15_paged_attention`). They follow Transformers' `paged_attention`
+interface, update its cache, then run one packed varlen Hopper grid over the
+active requests. This interface is for the standard generation cache; use
+`paged_triton_attention` with `DifferentiablePagedCache` when gradients to
+physical cache pages are required during training.
+
 The Triton implementation reads physical K/V pages directly through the
 `block_table`; it does not materialize gathered K/V tensors or the quadratic
 attention matrix. Backward atomically accumulates K/V gradients directly into
@@ -348,4 +356,9 @@ The old `Qwen_attention.py` module is kept as a compatibility shim, but new code
 - The single-block experimental Triton kernels require CUDA tensors, no dropout, no external padding mask on the fast path, matching Q/K/V head dimensions, and `key_length <= max_block_n` where the default is 4096. The Hopper FA3-style kernels support training dropout with a saved Philox-style seed and recompute the mask in backward without storing a dense attention mask.
 - If a mask/dropout/CPU path is encountered through the HuggingFace wrapper, the Triton wrapper falls back to the custom SDPA implementation to preserve math.
 - The Hopper multi-block kernels remove the single-block 4096-key limit. Further work remains for native BlockMask traversal and deeper Hopper-specific scheduling/autotuning.
+
+On Hopper (H100), the FA3-style kernels are covered in BF16 with full
+forward/backward and `torch.compile(fullgraph=True)` regression tests for all
+three normalizers. Varlen and direct physical-page Paged paths are also
+validated in BF16. Validation on non-Hopper GPU architectures remains pending.
 - Paged Softmax1, sparsemax, and entmax15 kernels read K/V directly through block tables and scatter K/V gradients directly into physical cache pages.

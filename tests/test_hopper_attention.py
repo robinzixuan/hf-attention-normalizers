@@ -97,6 +97,27 @@ class HopperSparseAttentionTest(unittest.TestCase):
                     self.assertTrue(torch.equal(first, second))
                     self.assertTrue(torch.isfinite(first).all())
 
+    def test_bfloat16_torch_compile_forward_and_backward(self):
+        for kernel in (
+            hopper_softmax1_attention,
+            hopper_sparsemax_attention,
+            hopper_entmax15_attention,
+        ):
+            with self.subTest(kernel=kernel.__name__):
+                def attention(query, key, value):
+                    return kernel(query, key, value, is_causal=True)
+
+                compiled = torch.compile(attention, fullgraph=True)
+                query = torch.randn(
+                    1, 2, 16, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+                )
+                key = torch.randn_like(query, requires_grad=True)
+                value = torch.randn_like(query, requires_grad=True)
+                output = compiled(query, key, value)
+                output.float().square().mean().backward()
+                self.assertTrue(torch.isfinite(output).all())
+                self.assertTrue(all(torch.isfinite(x.grad).all() for x in (query, key, value)))
+
     def test_softmax1_huggingface_backend(self):
         from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 

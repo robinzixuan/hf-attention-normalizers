@@ -4,6 +4,7 @@ import torch
 
 from hf_attention_normalizers import varlen_hopper_attention
 from hf_attention_normalizers.backends import resolve_softmax_fn
+from hf_attention_normalizers.backends import paged_normalizer_attention_forward
 
 
 def _packed_reference(query, key, value, cu_q, cu_k, normalizer):
@@ -79,6 +80,43 @@ class VarlenHopperAttentionTest(unittest.TestCase):
                         (actual.float() - expected).abs().mean().item(),
                         0.001,
                     )
+
+    def test_huggingface_paged_attention_interface(self):
+        from torch import nn
+
+        class Module(nn.Module):
+            layer_idx = 0
+            scaling = 32**-0.5
+
+        cu_q = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
+        cu_k = torch.tensor([0, 4, 9], device="cuda", dtype=torch.int32)
+        for normalizer in ("softmax1", "sparsemax", "entmax15"):
+            with self.subTest(normalizer=normalizer):
+                torch.manual_seed(113)
+                query = torch.randn(1, 4, 5, 32, device="cuda", dtype=torch.float16)
+                key = torch.randn(1, 2, 9, 32, device="cuda", dtype=torch.float16)
+                value = torch.randn_like(key)
+                output, _ = paged_normalizer_attention_forward(
+                    Module(),
+                    query,
+                    key,
+                    value,
+                    cu_seq_lens_q=cu_q,
+                    cu_seq_lens_k=cu_k,
+                    max_seqlen_q=3,
+                    max_seqlen_k=5,
+                    softmax_fn=resolve_softmax_fn(normalizer),
+                )
+                reference = _packed_reference(
+                    query.transpose(1, 2).squeeze(0).float(),
+                    key.transpose(1, 2).squeeze(0).float(),
+                    value.transpose(1, 2).squeeze(0).float(),
+                    cu_q,
+                    cu_k,
+                    normalizer,
+                )
+                self.assertEqual(output.shape, (5, 4, 32))
+                self.assertLess((output.float() - reference).abs().mean().item(), 0.001)
 
 
 if __name__ == "__main__":
