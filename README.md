@@ -368,3 +368,20 @@ forward/backward and `torch.compile(fullgraph=True)` regression tests for all
 three normalizers. Varlen and direct physical-page Paged paths are also
 validated in BF16. Validation on non-Hopper GPU architectures remains pending.
 - Paged Softmax1, sparsemax, and entmax15 kernels read K/V directly through block tables and scatter K/V gradients directly into physical cache pages.
+
+## Citation
+
+If you use `hf-attention-normalizers` in research or a project, please cite the
+software release:
+
+```bibtex
+@software{luo_hf_attention_normalizers_2026,
+  author  = {Luo, Robin},
+  title   = {hf-attention-normalizers},
+  version = {0.1.0},
+  year    = {2026},
+  url     = {https://github.com/robinzixuan/hf-attention-normalizers}
+}
+```
+
+PyPI package: <https://pypi.org/project/hf-attention-normalizers/>.
