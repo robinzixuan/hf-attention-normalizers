@@ -118,6 +118,30 @@ class VarlenHopperAttentionTest(unittest.TestCase):
                 self.assertEqual(output.shape, (5, 4, 32))
                 self.assertLess((output.float() - reference).abs().mean().item(), 0.001)
 
+    def test_bfloat16_torch_compile_forward_and_backward(self):
+        cu_q = torch.tensor([0, 3, 5], device="cuda", dtype=torch.int32)
+        cu_k = torch.tensor([0, 4, 9], device="cuda", dtype=torch.int32)
+        for normalizer in ("softmax1", "sparsemax", "entmax15"):
+            with self.subTest(normalizer=normalizer):
+                def attention(query, key, value):
+                    return varlen_hopper_attention(
+                        query, key, value, cu_q, cu_k, normalizer,
+                        max_seqlen_q=3, max_seqlen_k=5,
+                    )
+
+                compiled = torch.compile(attention, fullgraph=True)
+                query = torch.randn(
+                    5, 4, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+                )
+                key = torch.randn(
+                    9, 2, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+                )
+                value = torch.randn_like(key, requires_grad=True)
+                output = compiled(query, key, value)
+                output.float().square().mean().backward()
+                self.assertTrue(torch.isfinite(output).all())
+                self.assertTrue(all(torch.isfinite(x.grad).all() for x in (query, key, value)))
+
 
 if __name__ == "__main__":
     unittest.main()

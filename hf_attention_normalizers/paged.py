@@ -260,6 +260,8 @@ def paged_triton_attention(
     scale: Optional[float] = None,
     is_causal: bool = True,
     max_block_n: int = 4096,
+    max_key_length: Optional[int] = None,
+    assume_unique_pages: bool = False,
 ) -> torch.Tensor:
     """Paged sparse attention using the fused Triton forward/backward kernels.
 
@@ -285,9 +287,15 @@ def paged_triton_attention(
     if query.shape[1] % key_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads.")
 
-    physical_indices, _ = paged_cache_indices(block_table, sequence_lengths, block_size)
-    if int(physical_indices.max().item()) >= key_cache.shape[0]:
-        raise ValueError("block_table references a block outside the physical cache.")
+    if torch.compiler.is_compiling():
+        if max_key_length is None:
+            raise ValueError("Compiled paged attention requires static max_key_length.")
+    else:
+        physical_indices, _ = paged_cache_indices(block_table, sequence_lengths, block_size)
+        if int(physical_indices.max().item()) >= key_cache.shape[0]:
+            raise ValueError("block_table references a block outside the physical cache.")
+        if max_key_length is None:
+            max_key_length = int(sequence_lengths.max().item())
     common_kwargs = {
         "query": query,
         "key_cache": key_cache,
@@ -302,6 +310,8 @@ def paged_triton_attention(
         # at practical decode/prefill lengths. Callers can still cap it for
         # very small heads or constrained kernels through ``max_block_n``.
         "block_n": min(256, max_block_n),
+        "max_key_length": max_key_length,
+        "assume_unique_pages": assume_unique_pages,
     }
     if normalizer in {"softmax1", "softmax_1"}:
         return paged_hopper_softmax1_attention(**common_kwargs)

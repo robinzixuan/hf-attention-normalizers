@@ -188,20 +188,21 @@ if triton is not None:
     @triton.jit
     def _paged_sparse_backward(
         query, key_cache, value_cache, block_table, sequence_lengths, grad_output,
-        thresholds, grad_query, grad_key_cache, grad_value_cache,
+        thresholds, corrections, grad_query, grad_key_cache, grad_value_cache,
         stride_qb: tl.constexpr, stride_qh: tl.constexpr, stride_ql: tl.constexpr, stride_qd: tl.constexpr,
         stride_kt: tl.constexpr, stride_kh: tl.constexpr, stride_kd: tl.constexpr,
         stride_vt: tl.constexpr, stride_vh: tl.constexpr, stride_vd: tl.constexpr,
         stride_btb: tl.constexpr, stride_btn: tl.constexpr,
         stride_dob: tl.constexpr, stride_doh: tl.constexpr, stride_dol: tl.constexpr, stride_dod: tl.constexpr,
         stride_tb: tl.constexpr, stride_th: tl.constexpr, stride_tl: tl.constexpr,
+        stride_cb: tl.constexpr, stride_ch: tl.constexpr, stride_cl: tl.constexpr,
         stride_dqb: tl.constexpr, stride_dqh: tl.constexpr, stride_dql: tl.constexpr, stride_dqd: tl.constexpr,
         stride_dkt: tl.constexpr, stride_dkh: tl.constexpr, stride_dkd: tl.constexpr,
         stride_dvt: tl.constexpr, stride_dvh: tl.constexpr, stride_dvd: tl.constexpr,
         query_length: tl.constexpr, max_key_length: tl.constexpr, head_dim: tl.constexpr,
         num_query_heads: tl.constexpr, num_kv_heads: tl.constexpr, scale: tl.constexpr,
         is_causal: tl.constexpr, mode: tl.constexpr, PAGE_SIZE: tl.constexpr,
-        BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, WRITE_KV: tl.constexpr,
     ):
         batch_index = tl.program_id(0)
         query_head = tl.program_id(1)
@@ -250,6 +251,10 @@ if triton is not None:
             numerator += tl.sum(inverse_hessian * grad_probabilities, axis=0)
             denominator += tl.sum(inverse_hessian, axis=0)
         correction = numerator / denominator
+        tl.store(
+            corrections + batch_index * stride_cb + query_head * stride_ch + query_index * stride_cl,
+            correction,
+        )
 
         grad_q = tl.zeros((BLOCK_D,), tl.float32)
         for start_n in tl.range(0, max_key_length, BLOCK_N):
@@ -275,22 +280,109 @@ if triton is not None:
             grad_probabilities = tl.sum(values * grad_out[None, :], axis=1)
             grad_scores = tl.where(valid_n, inverse_hessian * (grad_probabilities - correction), 0.0)
             grad_q += tl.sum(grad_scores[:, None] * keys, axis=0) * scale
-            tl.atomic_add(
-                grad_key_cache + physical_tokens[:, None] * stride_dkt
-                + kv_head * stride_dkh + offsets_d[None, :] * stride_dkd,
-                grad_scores[:, None] * q[None, :] * scale,
-                mask=valid_n[:, None] & valid_d[None, :],
-            )
-            tl.atomic_add(
-                grad_value_cache + physical_tokens[:, None] * stride_dvt
-                + kv_head * stride_dvh + offsets_d[None, :] * stride_dvd,
-                probabilities[:, None] * grad_out[None, :],
-                mask=valid_n[:, None] & valid_d[None, :],
-            )
+            if WRITE_KV:
+                tl.atomic_add(
+                    grad_key_cache + physical_tokens[:, None] * stride_dkt
+                    + kv_head * stride_dkh + offsets_d[None, :] * stride_dkd,
+                    grad_scores[:, None] * q[None, :] * scale,
+                    mask=valid_n[:, None] & valid_d[None, :],
+                )
+                tl.atomic_add(
+                    grad_value_cache + physical_tokens[:, None] * stride_dvt
+                    + kv_head * stride_dvh + offsets_d[None, :] * stride_dvd,
+                    probabilities[:, None] * grad_out[None, :],
+                    mask=valid_n[:, None] & valid_d[None, :],
+                )
         tl.store(
             grad_query + batch_index * stride_dqb + query_head * stride_dqh
             + query_index * stride_dql + offsets_d * stride_dqd,
             grad_q, mask=valid_d,
+        )
+
+
+    @triton.jit
+    def _paged_sparse_kv_backward(
+        query, key_cache, value_cache, block_table, sequence_lengths, grad_output,
+        thresholds, corrections, grad_key_cache, grad_value_cache,
+        stride_qb: tl.constexpr, stride_qh: tl.constexpr, stride_ql: tl.constexpr, stride_qd: tl.constexpr,
+        stride_kt: tl.constexpr, stride_kh: tl.constexpr, stride_kd: tl.constexpr,
+        stride_vt: tl.constexpr, stride_vh: tl.constexpr, stride_vd: tl.constexpr,
+        stride_btb: tl.constexpr, stride_btn: tl.constexpr,
+        stride_dob: tl.constexpr, stride_doh: tl.constexpr, stride_dol: tl.constexpr, stride_dod: tl.constexpr,
+        stride_tb: tl.constexpr, stride_th: tl.constexpr, stride_tl: tl.constexpr,
+        stride_cb: tl.constexpr, stride_ch: tl.constexpr, stride_cl: tl.constexpr,
+        stride_dkt: tl.constexpr, stride_dkh: tl.constexpr, stride_dkd: tl.constexpr,
+        stride_dvt: tl.constexpr, stride_dvh: tl.constexpr, stride_dvd: tl.constexpr,
+        query_length: tl.constexpr, max_key_length: tl.constexpr, head_dim: tl.constexpr,
+        num_query_heads: tl.constexpr, num_kv_heads: tl.constexpr, scale: tl.constexpr,
+        is_causal: tl.constexpr, mode: tl.constexpr, PAGE_SIZE: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        batch_index = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        tile_index = tl.program_id(2)
+        offsets_n = tile_index * BLOCK_N + tl.arange(0, BLOCK_N)
+        offsets_d = tl.arange(0, BLOCK_D)
+        key_length = tl.load(sequence_lengths + batch_index)
+        valid_n = offsets_n < key_length
+        valid_d = offsets_d < head_dim
+        logical_blocks = offsets_n // PAGE_SIZE
+        physical_blocks = tl.load(
+            block_table + batch_index * stride_btb + logical_blocks * stride_btn,
+            mask=valid_n,
+            other=0,
+        )
+        physical_tokens = physical_blocks * PAGE_SIZE + offsets_n % PAGE_SIZE
+        grad_key = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        grad_value = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+        for group_index in tl.static_range(0, num_query_heads // num_kv_heads):
+            query_head = kv_head * (num_query_heads // num_kv_heads) + group_index
+            for query_index in tl.range(0, query_length):
+                causal_limit = query_index + key_length - query_length
+                row_valid = valid_n
+                if is_causal:
+                    row_valid = row_valid & (offsets_n <= causal_limit)
+                q = tl.load(
+                    query + batch_index * stride_qb + query_head * stride_qh
+                    + query_index * stride_ql + offsets_d * stride_qd,
+                    mask=valid_d,
+                    other=0.0,
+                ).to(tl.float32)
+                grad_out = tl.load(
+                    grad_output + batch_index * stride_dob + query_head * stride_doh
+                    + query_index * stride_dol + offsets_d * stride_dod,
+                    mask=valid_d,
+                    other=0.0,
+                ).to(tl.float32)
+                threshold = tl.load(
+                    thresholds + batch_index * stride_tb + query_head * stride_th + query_index * stride_tl
+                )
+                correction = tl.load(
+                    corrections + batch_index * stride_cb + query_head * stride_ch + query_index * stride_cl
+                )
+                keys = tl.load(
+                    key_cache + physical_tokens[:, None] * stride_kt + kv_head * stride_kh + offsets_d[None, :] * stride_kd,
+                    mask=row_valid[:, None] & valid_d[None, :], other=0.0,
+                ).to(tl.float32)
+                values = tl.load(
+                    value_cache + physical_tokens[:, None] * stride_vt + kv_head * stride_vh + offsets_d[None, :] * stride_vd,
+                    mask=row_valid[:, None] & valid_d[None, :], other=0.0,
+                ).to(tl.float32)
+                scores = tl.sum(keys * q[None, :], axis=1) * scale
+                positive = tl.maximum((scores if mode == 0 else scores * 0.5) - threshold, 0.0)
+                probabilities = tl.where(row_valid, positive if mode == 0 else positive * positive, 0.0)
+                inverse_hessian = (positive > 0.0).to(tl.float32) if mode == 0 else positive
+                inverse_hessian = tl.where(row_valid, inverse_hessian, 0.0)
+                grad_scores = inverse_hessian * (tl.sum(values * grad_out[None, :], axis=1) - correction)
+                grad_key += grad_scores[:, None] * q[None, :] * scale
+                grad_value += probabilities[:, None] * grad_out[None, :]
+        tl.store(
+            grad_key_cache + physical_tokens[:, None] * stride_dkt + kv_head * stride_dkh + offsets_d[None, :] * stride_dkd,
+            grad_key, mask=valid_n[:, None] & valid_d[None, :],
+        )
+        tl.store(
+            grad_value_cache + physical_tokens[:, None] * stride_dvt + kv_head * stride_dvh + offsets_d[None, :] * stride_dvd,
+            grad_value, mask=valid_n[:, None] & valid_d[None, :],
         )
 
 
@@ -302,11 +394,12 @@ class _PagedSparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, query, key_cache, value_cache, block_table, sequence_lengths,
-        page_size, scale, is_causal, mode, block_n, bisection_steps,
+        page_size, scale, is_causal, mode, block_n, bisection_steps, max_key_length, assume_unique_pages,
     ):
         batch, query_heads, query_length, head_dim = query.shape
         kv_heads = key_cache.shape[1]
-        max_key_length = int(sequence_lengths.max().item())
+        if max_key_length is None:
+            max_key_length = int(sequence_lengths.max().item())
         block_d = _next_power_of_2(head_dim)
         output = torch.empty_like(query)
         thresholds = torch.empty(
@@ -324,31 +417,48 @@ class _PagedSparseAttention(torch.autograd.Function):
         ctx.save_for_backward(
             query, key_cache, value_cache, block_table, sequence_lengths, thresholds
         )
-        ctx.args = (page_size, scale, is_causal, mode, block_n)
+        ctx.args = (page_size, scale, is_causal, mode, block_n, max_key_length, assume_unique_pages)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         query, key_cache, value_cache, block_table, sequence_lengths, thresholds = ctx.saved_tensors
-        page_size, scale, is_causal, mode, block_n = ctx.args
+        page_size, scale, is_causal, mode, block_n, max_key_length, assume_unique_pages = ctx.args
         batch, query_heads, query_length, head_dim = query.shape
         kv_heads = key_cache.shape[1]
-        max_key_length = int(sequence_lengths.max().item())
         block_d = _next_power_of_2(head_dim)
         grad_query = torch.empty_like(query, dtype=torch.float32)
         grad_key = torch.zeros_like(key_cache, dtype=torch.float32)
         grad_value = torch.zeros_like(value_cache, dtype=torch.float32)
+        corrections = torch.empty_like(thresholds)
+        no_shared_pages = (
+            assume_unique_pages
+            if torch.compiler.is_compiling()
+            else assume_unique_pages or bool(torch.unique(block_table).numel() == block_table.numel())
+        )
         grid = (batch, query_heads, query_length)
         _paged_sparse_backward[grid](
             query, key_cache, value_cache, block_table, sequence_lengths, grad_output,
-            thresholds, grad_query, grad_key, grad_value,
+            thresholds, corrections, grad_query, grad_key, grad_value,
             *query.stride(), *key_cache.stride(), *value_cache.stride(), *block_table.stride(),
-            *grad_output.stride(), *thresholds.stride(), *grad_query.stride(),
+            *grad_output.stride(), *thresholds.stride(), *corrections.stride(), *grad_query.stride(),
             *grad_key.stride(), *grad_value.stride(), query_length, max_key_length, head_dim,
             query_heads, kv_heads, scale, is_causal, mode, PAGE_SIZE=page_size,
-            BLOCK_N=block_n, BLOCK_D=block_d,
+            BLOCK_N=block_n, BLOCK_D=block_d, WRITE_KV=not no_shared_pages,
         )
-        return grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None
+        if no_shared_pages:
+            reduction_block_n = min(16, block_n)
+            reduction_grid = (batch, kv_heads, triton.cdiv(max_key_length, reduction_block_n))
+            _paged_sparse_kv_backward[reduction_grid](
+                query, key_cache, value_cache, block_table, sequence_lengths, grad_output,
+                thresholds, corrections, grad_key, grad_value,
+                *query.stride(), *key_cache.stride(), *value_cache.stride(), *block_table.stride(),
+                *grad_output.stride(), *thresholds.stride(), *corrections.stride(),
+                *grad_key.stride(), *grad_value.stride(), query_length, max_key_length, head_dim,
+                query_heads, kv_heads, scale, is_causal, mode, PAGE_SIZE=page_size,
+                BLOCK_N=reduction_block_n, BLOCK_D=block_d,
+            )
+        return grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None, None, None
 
 
 def paged_hopper_sparse_attention(
@@ -363,6 +473,8 @@ def paged_hopper_sparse_attention(
     is_causal: bool = True,
     block_n: int = 128,
     bisection_steps: int = 24,
+    max_key_length: Optional[int] = None,
+    assume_unique_pages: bool = False,
 ) -> torch.Tensor:
     if triton is None:
         raise ImportError("Paged Hopper attention requires Triton.")
@@ -380,5 +492,5 @@ def paged_hopper_sparse_attention(
     mode = 0 if normalizer == "sparsemax" else 1
     return _PagedSparseAttention.apply(
         query, key_cache, value_cache, block_table, sequence_lengths,
-        page_size, actual_scale, is_causal, mode, block_n, bisection_steps,
+        page_size, actual_scale, is_causal, mode, block_n, bisection_steps, max_key_length, assume_unique_pages,
     )

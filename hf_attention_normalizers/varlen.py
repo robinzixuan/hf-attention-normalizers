@@ -13,6 +13,10 @@ def _validate_cumulative_lengths(
         raise ValueError(f"{name} must have shape [batch + 1].")
     if cumulative_lengths.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"{name} must use int32 or int64.")
+    # Scalar validation is intentionally eager-only: Dynamo cannot capture the
+    # `.item()` checks, while compiled callers provide static max lengths below.
+    if torch.compiler.is_compiling():
+        return
     if int(cumulative_lengths[0].item()) != 0:
         raise ValueError(f"{name} must start at zero.")
     if int(cumulative_lengths[-1].item()) != total_tokens:
@@ -56,16 +60,21 @@ def varlen_hopper_attention(
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
         raise ValueError("Q and K cumulative lengths must describe the same batch.")
 
-    q_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-    k_lengths = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-    if bool((q_lengths <= 0).any()) or bool((k_lengths <= 0).any()):
-        raise ValueError("Empty packed sequences are not supported.")
-    actual_max_q = int(q_lengths.max().item())
-    actual_max_k = int(k_lengths.max().item())
-    if max_seqlen_q is not None and max_seqlen_q < actual_max_q:
-        raise ValueError("max_seqlen_q is smaller than an actual Q sequence.")
-    if max_seqlen_k is not None and max_seqlen_k < actual_max_k:
-        raise ValueError("max_seqlen_k is smaller than an actual K sequence.")
+    if torch.compiler.is_compiling():
+        if max_seqlen_q is None or max_seqlen_k is None:
+            raise ValueError("Compiled varlen attention requires static max_seqlen_q and max_seqlen_k.")
+        actual_max_q, actual_max_k = max_seqlen_q, max_seqlen_k
+    else:
+        q_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        k_lengths = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        if bool((q_lengths <= 0).any()) or bool((k_lengths <= 0).any()):
+            raise ValueError("Empty packed sequences are not supported.")
+        actual_max_q = int(q_lengths.max().item())
+        actual_max_k = int(k_lengths.max().item())
+        if max_seqlen_q is not None and max_seqlen_q < actual_max_q:
+            raise ValueError("max_seqlen_q is smaller than an actual Q sequence.")
+        if max_seqlen_k is not None and max_seqlen_k < actual_max_k:
+            raise ValueError("max_seqlen_k is smaller than an actual K sequence.")
 
     if normalizer in {"softmax1", "softmax_1"}:
         # Packed kernels launch a single grid across every sequence and head.

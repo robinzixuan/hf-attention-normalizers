@@ -260,6 +260,12 @@ The Triton implementation reads physical K/V pages directly through the
 attention matrix. Backward atomically accumulates K/V gradients directly into
 their physical cache pages.
 
+For training batches whose `block_table` has no shared physical pages,
+`paged_triton_attention(..., max_key_length=..., assume_unique_pages=True)`
+uses a two-stage KV-tile reduction without atomics and supports BF16
+`torch.compile(fullgraph=True)`. The flag is an explicit correctness contract:
+leave it at its default (`False`) whenever pages can be shared.
+
 For incremental HuggingFace training, `DifferentiablePagedCache` uses
 functional page writes so gradients remain connected across cache updates:
 

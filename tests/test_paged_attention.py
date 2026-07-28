@@ -87,6 +87,60 @@ class PagedAttentionTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "Paged Triton tests require CUDA")
 class PagedTritonAttentionTest(unittest.TestCase):
+    def test_bfloat16_torch_compile_with_unique_pages(self):
+        block_table = torch.tensor([[0, 1], [2, 3]], device="cuda")
+        sequence_lengths = torch.tensor([8, 7], device="cuda")
+        for normalizer in ("softmax1", "sparsemax", "entmax15"):
+            with self.subTest(normalizer=normalizer):
+                def attention(query, key_cache, value_cache):
+                    return paged_triton_attention(
+                        query, key_cache, value_cache, block_table, sequence_lengths,
+                        block_size=4, normalizer=normalizer, max_key_length=8,
+                        assume_unique_pages=True,
+                    )
+
+                compiled = torch.compile(attention, fullgraph=True)
+                query = torch.randn(
+                    2, 4, 2, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+                )
+                key_cache = torch.randn(
+                    16, 2, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+                )
+                value_cache = torch.randn_like(key_cache, requires_grad=True)
+                output = compiled(query, key_cache, value_cache)
+                output.float().square().mean().backward()
+                self.assertTrue(torch.isfinite(output).all())
+                self.assertTrue(all(torch.isfinite(x.grad).all() for x in (query, key_cache, value_cache)))
+
+    def test_softmax1_unshared_pages_use_reduced_kv_backward(self):
+        torch.manual_seed(47)
+        query = torch.randn(2, 4, 4, 16, device="cuda", dtype=torch.float16, requires_grad=True)
+        key_cache = torch.randn(32, 2, 16, device="cuda", dtype=torch.float16, requires_grad=True)
+        value_cache = torch.randn_like(key_cache, requires_grad=True)
+        ref_query = query.detach().float().requires_grad_(True)
+        ref_key = key_cache.detach().float().requires_grad_(True)
+        ref_value = value_cache.detach().float().requires_grad_(True)
+        # No physical block is shared, selecting the non-atomic KV reduction.
+        block_table = torch.tensor([[0, 1], [2, 3]], device="cuda")
+        sequence_lengths = torch.tensor([7, 5], device="cuda")
+        output = paged_triton_attention(
+            query, key_cache, value_cache, block_table, sequence_lengths,
+            block_size=4, normalizer="softmax1",
+        )
+        reference = paged_attention(
+            ref_query, ref_key, ref_value, block_table, sequence_lengths,
+            block_size=4, normalizer="softmax1",
+        )
+        upstream = torch.randn_like(reference)
+        output.backward(upstream.to(output.dtype))
+        reference.backward(upstream)
+        self.assertLess((output.float() - reference).abs().mean().item(), 0.01)
+        for actual, expected in zip(
+            (query.grad, key_cache.grad, value_cache.grad),
+            (ref_query.grad, ref_key.grad, ref_value.grad),
+        ):
+            self.assertLess((actual.float() - expected).abs().mean().item(), 0.001)
+
     def test_variable_length_forward_and_cache_scatter_backward(self):
         for normalizer in ("softmax1", "sparsemax", "entmax15"):
             with self.subTest(normalizer=normalizer):
