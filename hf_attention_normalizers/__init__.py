@@ -26,6 +26,7 @@ from .paged import (
     paged_cache_indices,
     paged_triton_attention,
 )
+from .varlen import varlen_hopper_attention
 
 __all__ = [
     "AttentionReplacementPolicy",
@@ -52,4 +53,5 @@ __all__ = [
     "paged_triton_attention",
     "DifferentiablePagedCache",
     "DifferentiablePagedCacheLayer",
+    "varlen_hopper_attention",
 ]

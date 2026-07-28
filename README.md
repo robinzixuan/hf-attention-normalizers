@@ -280,6 +280,32 @@ Unlike HuggingFace's inference-oriented paged cache, writes are out-of-place
 `index_copy` operations. This preserves gradients to both earlier cached K/V
 states and newly written K/V states.
 
+## Packed Variable-Length Attention
+
+Softmax1, sparsemax, and entmax15 support FlashAttention-style packed Q/K/V
+layouts with cumulative sequence lengths:
+
+```python
+from hf_attention_normalizers import varlen_hopper_attention
+
+output = varlen_hopper_attention(
+    query,  # [total_q, query_heads, head_dim]
+    key,    # [total_k, kv_heads, head_dim]
+    value,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    normalizer="softmax1",
+    max_seqlen_q=max_q,
+    max_seqlen_k=max_k,
+    is_causal=True,
+)
+```
+
+The packed path supports GQA, different Q/K lengths, per-request bottom-right
+causal alignment, and full backward. It currently launches one fused Hopper
+kernel per request; a single combined varlen grid remains a launch-overhead
+optimization.
+
 ## Qwen3 Surgery Path
 
 For models that do not use HuggingFace `AttentionInterface`, use the surgery path:
@@ -321,5 +347,5 @@ The old `Qwen_attention.py` module is kept as a compatibility shim, but new code
 - Their fused backward kernels recompute probabilities row-by-row instead of storing the quadratic attention matrix, then directly accumulate Q/K/V gradients.
 - The experimental Triton kernels currently require CUDA tensors, no dropout, no external padding mask on the fast path, matching Q/K/V head dimensions, and `key_length <= max_block_n` where the default is 4096.
 - If a mask/dropout/CPU path is encountered through the HuggingFace wrapper, the Triton wrapper falls back to the custom SDPA implementation to preserve math.
-- The Hopper multi-block kernels remove the single-block 4096-key limit. Further work remains for direct paged block-table loads, native BlockMask traversal, and deeper Hopper-specific scheduling/autotuning.
-- Paged attention needs paged KV-cache-aware kernels and is not implemented yet.
+- The Hopper multi-block kernels remove the single-block 4096-key limit. Further work remains for native BlockMask traversal and deeper Hopper-specific scheduling/autotuning.
+- Paged Softmax1, sparsemax, and entmax15 kernels read K/V directly through block tables and scatter K/V gradients directly into physical cache pages.
