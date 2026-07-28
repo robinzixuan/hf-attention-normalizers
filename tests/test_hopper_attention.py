@@ -72,6 +72,31 @@ class HopperSparseAttentionTest(unittest.TestCase):
                 self.assertTrue(torch.isfinite(key.grad).all())
                 self.assertTrue(torch.isfinite(value.grad).all())
 
+    def test_fused_dropout_is_reproducible_and_has_finite_backward(self):
+        for kernel in (
+            hopper_softmax1_attention,
+            hopper_sparsemax_attention,
+            hopper_entmax15_attention,
+        ):
+            with self.subTest(kernel=kernel.__name__):
+                torch.manual_seed(41)
+                inputs = [
+                    torch.randn(1, 2, 17, 32, device="cuda", dtype=torch.float16)
+                    for _ in range(3)
+                ]
+                runs = []
+                for _ in range(2):
+                    query, key, value = [
+                        tensor.detach().clone().requires_grad_(True) for tensor in inputs
+                    ]
+                    torch.manual_seed(97)
+                    output = kernel(query, key, value, is_causal=True, dropout_p=0.2)
+                    output.float().square().mean().backward()
+                    runs.append((output.detach(), query.grad.detach(), key.grad.detach(), value.grad.detach()))
+                for first, second in zip(runs[0], runs[1]):
+                    self.assertTrue(torch.equal(first, second))
+                    self.assertTrue(torch.isfinite(first).all())
+
     def test_softmax1_huggingface_backend(self):
         from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 

@@ -2,11 +2,6 @@ from typing import Optional
 
 import torch
 
-from .kernels import (
-    hopper_entmax15_attention,
-    hopper_softmax1_attention,
-    hopper_sparsemax_attention,
-)
 
 
 def _validate_cumulative_lengths(
@@ -73,34 +68,36 @@ def varlen_hopper_attention(
         raise ValueError("max_seqlen_k is smaller than an actual K sequence.")
 
     if normalizer in {"softmax1", "softmax_1"}:
-        kernel = hopper_softmax1_attention
-    elif normalizer == "sparsemax":
-        kernel = hopper_sparsemax_attention
-    elif normalizer == "entmax15":
-        kernel = hopper_entmax15_attention
-    else:
-        raise ValueError("normalizer must be softmax1, sparsemax, or entmax15.")
+        # Packed kernels launch a single grid across every sequence and head.
+        from .kernels.varlen_softmax1_hopper import varlen_hopper_softmax1_attention
 
-    groups = query.shape[1] // key.shape[1]
-    outputs = []
-    for batch_index in range(cu_seqlens_q.numel() - 1):
-        q_start = int(cu_seqlens_q[batch_index].item())
-        q_end = int(cu_seqlens_q[batch_index + 1].item())
-        k_start = int(cu_seqlens_k[batch_index].item())
-        k_end = int(cu_seqlens_k[batch_index + 1].item())
-        q = query[q_start:q_end].transpose(0, 1).unsqueeze(0)
-        k = key[k_start:k_end].transpose(0, 1).unsqueeze(0)
-        v = value[k_start:k_end].transpose(0, 1).unsqueeze(0)
-        if groups != 1:
-            k = k.repeat_interleave(groups, dim=1)
-            v = v.repeat_interleave(groups, dim=1)
-        kernel_kwargs = {
-            "scale": scale,
-            "is_causal": is_causal,
-            "block_n": block_n,
-        }
-        if normalizer in {"sparsemax", "entmax15"}:
-            kernel_kwargs["bisection_steps"] = bisection_steps
-        output = kernel(q, k, v, **kernel_kwargs)
-        outputs.append(output.squeeze(0).transpose(0, 1))
-    return torch.cat(outputs, dim=0)
+        return varlen_hopper_softmax1_attention(
+            query,
+            key,
+            value,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=actual_max_q if max_seqlen_q is None else max_seqlen_q,
+            max_seqlen_k=actual_max_k if max_seqlen_k is None else max_seqlen_k,
+            scale=scale,
+            is_causal=is_causal,
+            block_n=block_n,
+        )
+    if normalizer not in {"sparsemax", "entmax15"}:
+        raise ValueError("normalizer must be softmax1, sparsemax, or entmax15.")
+    from .kernels.varlen_sparse_entmax_hopper import varlen_hopper_sparse_attention
+
+    return varlen_hopper_sparse_attention(
+        query,
+        key,
+        value,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        normalizer=normalizer,
+        max_seqlen_q=actual_max_q if max_seqlen_q is None else max_seqlen_q,
+        max_seqlen_k=actual_max_k if max_seqlen_k is None else max_seqlen_k,
+        scale=scale,
+        is_causal=is_causal,
+        block_n=block_n,
+        bisection_steps=bisection_steps,
+    )

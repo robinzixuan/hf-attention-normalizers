@@ -302,9 +302,9 @@ output = varlen_hopper_attention(
 ```
 
 The packed path supports GQA, different Q/K lengths, per-request bottom-right
-causal alignment, and full backward. It currently launches one fused Hopper
-kernel per request; a single combined varlen grid remains a launch-overhead
-optimization.
+causal alignment, and full backward. Each normalizer launches one combined
+Hopper grid across the packed batch; inactive programs/tiles are masked from
+the cumulative sequence-length arrays, without padded Q/K/V staging.
 
 ## Qwen3 Surgery Path
 
@@ -340,12 +340,12 @@ The old `Qwen_attention.py` module is kept as a compatibility shim, but new code
 - Native PyTorch SDPA and native FlashAttention kernels do not expose a `softmax_fn` argument.
 - `softmax1_flash_attention_3` uses an online tiled Hopper kernel. It treats the Softmax1 denominator term as a virtual logit-0/value-0 sink, saves row max/denominator statistics, and recomputes probabilities during fused backward.
 - `sparsemax_flash_attention_3` and `entmax15_flash_attention_3` use this project's Hopper-oriented multi-block Triton kernels. They stream K/V tiles, solve the global normalization threshold by tiled bisection, save one threshold per query row, and recompute tiles during fused backward. They are FA3-style custom-normalizer kernels, not wrappers around the official fixed-softmax FA3 CUDA kernel.
-- Native FlexAttention exposes score and mask modifiers but keeps softmax fixed. Pure causal HuggingFace `BlockMask` objects route directly to the fused Hopper kernels without dense expansion. Combined padding, sliding-window, and arbitrary custom mask functions currently use the differentiable dense compatibility path.
+- Native FlexAttention exposes score and mask modifiers but keeps softmax fixed. Pure causal, causal sliding-window, and standard causal + right-padding HuggingFace `BlockMask` objects route to Hopper forward/backward without dense-mask expansion. The right-padding path currently dispatches one fused kernel per batch row because each row has a different valid K prefix. Left padding, sliding-window + padding, and arbitrary custom mask functions use the differentiable dense compatibility path.
 - `*_sdpa` in this project is a custom SDPA-like implementation that materializes attention weights so it can apply another normalizer.
 - `softmax1_flash_attention_2` uses `flash-attention-softmax-n`, not HuggingFace's native FlashAttention 2 kernel.
 - `sparsemax_triton` and `entmax15_triton` fuse QK, normalization, and PV in the forward pass without materializing the attention matrix.
 - Their fused backward kernels recompute probabilities row-by-row instead of storing the quadratic attention matrix, then directly accumulate Q/K/V gradients.
-- The experimental Triton kernels currently require CUDA tensors, no dropout, no external padding mask on the fast path, matching Q/K/V head dimensions, and `key_length <= max_block_n` where the default is 4096.
+- The single-block experimental Triton kernels require CUDA tensors, no dropout, no external padding mask on the fast path, matching Q/K/V head dimensions, and `key_length <= max_block_n` where the default is 4096. The Hopper FA3-style kernels support training dropout with a saved Philox-style seed and recompute the mask in backward without storing a dense attention mask.
 - If a mask/dropout/CPU path is encountered through the HuggingFace wrapper, the Triton wrapper falls back to the custom SDPA implementation to preserve math.
 - The Hopper multi-block kernels remove the single-block 4096-key limit. Further work remains for native BlockMask traversal and deeper Hopper-specific scheduling/autotuning.
 - Paged Softmax1, sparsemax, and entmax15 kernels read K/V directly through block tables and scatter K/V gradients directly into physical cache pages.

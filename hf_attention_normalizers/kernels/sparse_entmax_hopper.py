@@ -34,6 +34,7 @@ if triton is not None:
         value,
         output,
         thresholds,
+        seed,
         stride_qb: tl.constexpr,
         stride_qh: tl.constexpr,
         stride_ql: tl.constexpr,
@@ -58,7 +59,10 @@ if triton is not None:
         head_dim: tl.constexpr,
         scale: tl.constexpr,
         is_causal: tl.constexpr,
+        window_left: tl.constexpr,
         mode: tl.constexpr,
+        num_heads: tl.constexpr,
+        dropout_p: tl.constexpr,
         BISECTION_STEPS: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -81,6 +85,8 @@ if triton is not None:
             valid_n = offs_n < key_length
             if is_causal:
                 valid_n = valid_n & (offs_n <= causal_limit)
+            if window_left > 0:
+                valid_n = valid_n & (offs_n > causal_limit - window_left)
             scores, ignored_keys = _score_tile(
                 q, k_ptr, offs_n, offs_d, valid_n, valid_d, stride_ks, stride_kd, scale
             )
@@ -98,6 +104,8 @@ if triton is not None:
                 valid_n = offs_n < key_length
                 if is_causal:
                     valid_n = valid_n & (offs_n <= causal_limit)
+                if window_left > 0:
+                    valid_n = valid_n & (offs_n > causal_limit - window_left)
                 scores, ignored_keys = _score_tile(
                     q, k_ptr, offs_n, offs_d, valid_n, valid_d, stride_ks, stride_kd, scale
                 )
@@ -121,6 +129,8 @@ if triton is not None:
             valid_n = offs_n < key_length
             if is_causal:
                 valid_n = valid_n & (offs_n <= causal_limit)
+            if window_left > 0:
+                valid_n = valid_n & (offs_n > causal_limit - window_left)
             scores, ignored_keys = _score_tile(
                 q, k_ptr, offs_n, offs_d, valid_n, valid_d, stride_ks, stride_kd, scale
             )
@@ -128,6 +138,11 @@ if triton is not None:
             positive = tl.maximum(z - threshold, 0.0)
             probabilities = positive if mode == 0 else positive * positive
             probabilities = tl.where(valid_n, probabilities, 0.0)
+            rng_offsets = (
+                ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
+            )
+            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            probabilities = probabilities * keep.to(tl.float32) * (1.0 / (1.0 - dropout_p))
             values = tl.load(
                 v_ptr + offs_n[:, None] * stride_vs + offs_d[None, :] * stride_vd,
                 mask=valid_n[:, None] & valid_d[None, :],
@@ -155,6 +170,7 @@ if triton is not None:
         grad_query,
         grad_key,
         grad_value,
+        seed,
         stride_qb: tl.constexpr,
         stride_qh: tl.constexpr,
         stride_ql: tl.constexpr,
@@ -191,7 +207,10 @@ if triton is not None:
         head_dim: tl.constexpr,
         scale: tl.constexpr,
         is_causal: tl.constexpr,
+        window_left: tl.constexpr,
         mode: tl.constexpr,
+        num_heads: tl.constexpr,
+        dropout_p: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
@@ -225,6 +244,8 @@ if triton is not None:
             valid_n = offs_n < key_length
             if is_causal:
                 valid_n = valid_n & (offs_n <= causal_limit)
+            if window_left > 0:
+                valid_n = valid_n & (offs_n > causal_limit - window_left)
             scores, ignored_keys = _score_tile(
                 q, k_ptr, offs_n, offs_d, valid_n, valid_d, stride_ks, stride_kd, scale
             )
@@ -235,7 +256,12 @@ if triton is not None:
                 mask=valid_n[:, None] & valid_d[None, :],
                 other=0.0,
             ).to(tl.float32)
+            rng_offsets = (
+                ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
+            )
+            keep = tl.rand(seed, rng_offsets) >= dropout_p
             grad_probabilities = tl.sum(values * do[None, :], axis=1)
+            grad_probabilities *= keep.to(tl.float32) * (1.0 / (1.0 - dropout_p))
             inverse_hessian = (positive > 0.0).to(tl.float32) if mode == 0 else positive
             inverse_hessian = tl.where(valid_n, inverse_hessian, 0.0)
             correction_numerator += tl.sum(grad_probabilities * inverse_hessian, axis=0)
@@ -248,6 +274,8 @@ if triton is not None:
             valid_n = offs_n < key_length
             if is_causal:
                 valid_n = valid_n & (offs_n <= causal_limit)
+            if window_left > 0:
+                valid_n = valid_n & (offs_n > causal_limit - window_left)
             scores, keys = _score_tile(
                 q, k_ptr, offs_n, offs_d, valid_n, valid_d, stride_ks, stride_kd, scale
             )
@@ -260,7 +288,13 @@ if triton is not None:
                 mask=valid_n[:, None] & valid_d[None, :],
                 other=0.0,
             ).to(tl.float32)
+            rng_offsets = (
+                ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
+            )
+            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            dropout_scale = 1.0 / (1.0 - dropout_p)
             grad_probabilities = tl.sum(values * do[None, :], axis=1)
+            grad_probabilities *= keep.to(tl.float32) * dropout_scale
             inverse_hessian = (positive > 0.0).to(tl.float32) if mode == 0 else positive
             grad_scores = inverse_hessian * (grad_probabilities - correction)
             grad_scores = tl.where(valid_n, grad_scores, 0.0)
@@ -280,7 +314,7 @@ if triton is not None:
                 + pid_h * stride_dvh
                 + offs_n[:, None] * stride_dvs
                 + offs_d[None, :] * stride_dvd,
-                probabilities[:, None] * do[None, :],
+                probabilities[:, None] * keep[:, None].to(tl.float32) * dropout_scale * do[None, :],
                 mask=valid_n[:, None] & valid_d[None, :],
             )
         tl.store(
@@ -300,7 +334,7 @@ def _next_power_of_2(value: int) -> int:
 
 class _MultiBlockSparseAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, scale, is_causal, mode, block_n, bisection_steps):
+    def forward(ctx, query, key, value, scale, is_causal, window_left, mode, block_n, bisection_steps, dropout_p, seed):
         batch, heads, query_length, head_dim = query.shape
         key_length = key.shape[-2]
         block_d = _next_power_of_2(head_dim)
@@ -319,6 +353,7 @@ class _MultiBlockSparseAttention(torch.autograd.Function):
             value,
             output,
             thresholds,
+            seed,
             *query.stride(),
             *key.stride(),
             *value.stride(),
@@ -329,7 +364,10 @@ class _MultiBlockSparseAttention(torch.autograd.Function):
             head_dim,
             scale,
             is_causal,
+            window_left,
             mode,
+            heads,
+            dropout_p,
             BISECTION_STEPS=bisection_steps,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
@@ -337,8 +375,11 @@ class _MultiBlockSparseAttention(torch.autograd.Function):
         ctx.save_for_backward(query, key, value, thresholds)
         ctx.scale = scale
         ctx.is_causal = is_causal
+        ctx.window_left = window_left
         ctx.mode = mode
         ctx.block_n = block_n
+        ctx.dropout_p = dropout_p
+        ctx.seed = seed
         return output
 
     @staticmethod
@@ -360,6 +401,7 @@ class _MultiBlockSparseAttention(torch.autograd.Function):
             grad_query,
             grad_key,
             grad_value,
+            ctx.seed,
             *query.stride(),
             *key.stride(),
             *value.stride(),
@@ -373,11 +415,14 @@ class _MultiBlockSparseAttention(torch.autograd.Function):
             head_dim,
             ctx.scale,
             ctx.is_causal,
+            ctx.window_left,
             ctx.mode,
+            heads,
+            ctx.dropout_p,
             BLOCK_N=ctx.block_n,
             BLOCK_D=block_d,
         )
-        return grad_query, grad_key, grad_value, None, None, None, None, None
+        return grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None
 
 
 def _multi_block_attention(
@@ -386,9 +431,11 @@ def _multi_block_attention(
     value: torch.Tensor,
     scale: Optional[float],
     is_causal: bool,
+    window_left: Optional[int],
     mode: int,
     block_n: int,
     bisection_steps: int,
+    dropout_p: float,
 ) -> torch.Tensor:
     _require_triton()
     if not query.is_cuda or not key.is_cuda or not value.is_cuda:
@@ -399,16 +446,22 @@ def _multi_block_attention(
         raise ValueError("Q/K/V head dimensions must match.")
     if _next_power_of_2(query.shape[-1]) > 256:
         raise ValueError("head_dim larger than 256 is not supported.")
+    if not 0.0 <= dropout_p < 1.0:
+        raise ValueError("dropout_p must be in [0, 1).")
     actual_scale = query.shape[-1] ** -0.5 if scale is None else scale
+    seed = int(torch.empty((), device=query.device, dtype=torch.int64).random_(2**31 - 1).item())
     return _MultiBlockSparseAttention.apply(
         query,
         key,
         value,
         actual_scale,
         is_causal,
+        -1 if window_left is None else window_left,
         mode,
         block_n,
         bisection_steps,
+        dropout_p,
+        seed,
     )
 
 
@@ -418,11 +471,13 @@ def hopper_sparsemax_attention(
     value: torch.Tensor,
     scale: Optional[float] = None,
     is_causal: bool = False,
+    window_left: Optional[int] = None,
     block_n: int = 128,
     bisection_steps: int = 24,
+    dropout_p: float = 0.0,
 ) -> torch.Tensor:
     return _multi_block_attention(
-        query, key, value, scale, is_causal, 0, block_n, bisection_steps
+        query, key, value, scale, is_causal, window_left, 0, block_n, bisection_steps, dropout_p
     )
 
 
@@ -432,9 +487,11 @@ def hopper_entmax15_attention(
     value: torch.Tensor,
     scale: Optional[float] = None,
     is_causal: bool = False,
+    window_left: Optional[int] = None,
     block_n: int = 128,
     bisection_steps: int = 24,
+    dropout_p: float = 0.0,
 ) -> torch.Tensor:
     return _multi_block_attention(
-        query, key, value, scale, is_causal, 1, block_n, bisection_steps
+        query, key, value, scale, is_causal, window_left, 1, block_n, bisection_steps, dropout_p
     )

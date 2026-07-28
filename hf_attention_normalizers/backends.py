@@ -233,6 +233,165 @@ def _is_pure_causal_flex_mask(block_mask) -> bool:
     return unwrap(block_mask.mask_mod, set())
 
 
+def _sliding_window_from_flex_mask(block_mask) -> Optional[int]:
+    """Recognize HF's causal sliding-window mask and return its left width."""
+    found_causal = False
+    window = None
+
+    def walk(value):
+        nonlocal found_causal, window
+        if isinstance(value, tuple):
+            return all(walk(item) for item in value)
+        if not callable(value):
+            return True
+        qualified_name = getattr(value, "__qualname__", "")
+        if qualified_name == "causal_mask_function":
+            found_causal = True
+            return True
+        if "sliding_window_overlay.<locals>.inner_mask" in qualified_name:
+            integers = [
+                cell.cell_contents
+                for cell in (value.__closure__ or ())
+                if isinstance(cell.cell_contents, int)
+            ]
+            if len(integers) != 1:
+                return False
+            window = integers[0]
+            return True
+        # Padding is handled separately by _right_padded_lengths_from_flex_mask.
+        # Accept it here so a causal sliding-window mask combined with padding can
+        # still use the native windowed kernel.
+        if "padding_mask_function.<locals>.inner_mask" in qualified_name:
+            return True
+        if (
+            "add_offsets_to_mask_function.<locals>.inner_mask" not in qualified_name
+            and "and_masks.<locals>.and_mask" not in qualified_name
+        ):
+            return False
+        return all(walk(cell.cell_contents) for cell in (value.__closure__ or ()))
+
+    return window if walk(block_mask.mask_mod) and found_causal and window is not None else None
+
+
+def _right_padded_lengths_from_flex_mask(block_mask) -> Optional[torch.Tensor]:
+    """Return per-example K lengths for a causal HF padding BlockMask.
+
+    This deliberately recognizes only the standard Transformers composition of
+    causal/sliding-window masks and a 2-D *right-padded* attention mask.  Other
+    custom masks continue through the exact dense compatibility path below.
+    """
+    padding_mask = None
+    found_causal = False
+
+    def walk(value) -> bool:
+        nonlocal padding_mask, found_causal
+        if isinstance(value, tuple):
+            return all(walk(item) for item in value)
+        if not callable(value):
+            return True
+        qualified_name = getattr(value, "__qualname__", "")
+        if qualified_name == "causal_mask_function":
+            found_causal = True
+            return True
+        if "padding_mask_function.<locals>.inner_mask" in qualified_name:
+            tensors = [
+                cell.cell_contents
+                for cell in (value.__closure__ or ())
+                if isinstance(cell.cell_contents, torch.Tensor)
+            ]
+            if len(tensors) != 1 or padding_mask is not None:
+                return False
+            padding_mask = tensors[0]
+            return padding_mask.ndim == 2
+        if "sliding_window_overlay.<locals>.inner_mask" in qualified_name:
+            return True
+        if (
+            "add_offsets_to_mask_function.<locals>.inner_mask" not in qualified_name
+            and "and_masks.<locals>.and_mask" not in qualified_name
+        ):
+            return False
+        return all(walk(cell.cell_contents) for cell in (value.__closure__ or ()))
+
+    if not walk(block_mask.mask_mod) or not found_causal or padding_mask is None:
+        return None
+    padding_mask = padding_mask.to(dtype=torch.bool)
+    lengths = padding_mask.sum(dim=-1, dtype=torch.long)
+    positions = torch.arange(padding_mask.shape[-1], device=padding_mask.device)
+    if not torch.equal(padding_mask, positions[None, :] < lengths[:, None]):
+        return None
+    # An all-masked row has no well-defined sparse/entmax distribution. Preserve
+    # the dense fallback's behavior in that unusual case.
+    if bool((lengths == 0).any()):
+        return None
+    return lengths
+
+
+def _hopper_right_padded_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_lengths: torch.Tensor,
+    softmax_fn: Callable[..., torch.Tensor],
+    scale: Optional[float],
+    sliding_window: Optional[int],
+) -> torch.Tensor:
+    """Run native Hopper attention without materializing a dense padding mask.
+
+    The current Hopper kernels take a static K length.  We therefore launch one
+    fused kernel per batch row with its valid prefix, retaining autograd and
+    avoiding both dense mask materialization and padded K/V reads.
+    """
+    from .kernels.softmax1_hopper import hopper_softmax1_attention
+    from .kernels.sparse_entmax_hopper import (
+        hopper_entmax15_attention,
+        hopper_sparsemax_attention,
+    )
+
+    if key.shape[-3] != query.shape[-3]:
+        if query.shape[-3] % key.shape[-3] != 0:
+            raise ValueError("Query heads must be divisible by key/value heads.")
+        groups = query.shape[-3] // key.shape[-3]
+        key = repeat_kv(key, groups)
+        value = repeat_kv(value, groups)
+    kernels = {
+        softmax_1: hopper_softmax1_attention,
+        sparsemax: hopper_sparsemax_attention,
+        entmax15: hopper_entmax15_attention,
+    }
+    kernel = kernels[softmax_fn]
+    outputs = []
+    for batch_index, length in enumerate(key_lengths.tolist()):
+        batch_query = query[batch_index : batch_index + 1]
+        batch_key = key[batch_index : batch_index + 1, :, :length]
+        batch_value = value[batch_index : batch_index + 1, :, :length]
+        # The Hopper causal convention is bottom-right aligned.  For a padded
+        # prefill row, Q is sized to the batch maximum while its valid K prefix
+        # is shorter.  Split at the prefix: the first part is ordinary causal
+        # attention, while later (padded) queries may see the whole valid prefix.
+        valid_queries = min(length, batch_query.shape[-2])
+        parts = [
+            kernel(
+                batch_query[:, :, :valid_queries],
+                batch_key,
+                batch_value,
+                scale=scale,
+                is_causal=True,
+            )
+        ]
+        if valid_queries < batch_query.shape[-2]:
+            parts.append(
+                kernel(
+                    batch_query[:, :, valid_queries:],
+                    batch_key,
+                    batch_value,
+                    scale=scale,
+                    is_causal=False,
+                )
+            )
+        outputs.append(torch.cat(parts, dim=-2))
+    return torch.cat(outputs, dim=0)
+
+
 def flex_attention_normalizer_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -249,7 +408,39 @@ def flex_attention_normalizer_forward(
     except ImportError:
         BlockMask = ()  # type: ignore[assignment]
 
-    if isinstance(attention_mask, BlockMask) and _is_pure_causal_flex_mask(attention_mask):
+    mask_sliding_window = (
+        _sliding_window_from_flex_mask(attention_mask)
+        if isinstance(attention_mask, BlockMask)
+        else None
+    )
+    padding_lengths = (
+        _right_padded_lengths_from_flex_mask(attention_mask)
+        if isinstance(attention_mask, BlockMask)
+        else None
+    )
+    module_sliding_window = kwargs.pop("sliding_window", None)
+    sliding_window = (
+        mask_sliding_window
+        if mask_sliding_window is not None
+        else module_sliding_window
+    )
+    supports_native_padding = padding_lengths is not None and sliding_window is None
+    if isinstance(attention_mask, BlockMask) and (
+        _is_pure_causal_flex_mask(attention_mask)
+        or (mask_sliding_window is not None and padding_lengths is None)
+        or supports_native_padding
+    ):
+        if supports_native_padding and softmax_fn in (softmax_1, sparsemax, entmax15):
+            output = _hopper_right_padded_attention(
+                query,
+                key,
+                value,
+                padding_lengths,
+                softmax_fn,
+                scaling,
+                sliding_window,
+            )
+            return output.transpose(1, 2).contiguous(), None
         common_kwargs = {
             "module": module,
             "query": query,
@@ -259,6 +450,7 @@ def flex_attention_normalizer_forward(
             "dropout": dropout,
             "scaling": scaling,
             "is_causal": True,
+            "sliding_window": sliding_window,
         }
         if softmax_fn is softmax_1:
             return hopper_softmax1_attention_forward(**common_kwargs, **kwargs)
@@ -405,8 +597,9 @@ def _hopper_sparse_attention_forward(
 ) -> tuple[torch.Tensor, None]:
     kwargs.pop("softmax_fn", None)
     kwargs.pop("softmax_n_param", None)
+    sliding_window = kwargs.pop("sliding_window", None)
     normalizer_fn = sparsemax if normalizer == "sparsemax" else entmax15
-    if attention_mask is not None or dropout > 0 or not query.is_cuda:
+    if attention_mask is not None or not query.is_cuda:
         return sdpa_attention_forward(
             module,
             query,
@@ -442,6 +635,8 @@ def _hopper_sparse_attention_forward(
         is_causal=is_causal,
         block_n=block_n,
         bisection_steps=bisection_steps,
+        window_left=sliding_window,
+        dropout_p=dropout if module.training else 0.0,
     )
     return output.transpose(1, 2).contiguous(), None
 
@@ -468,7 +663,8 @@ def hopper_softmax1_attention_forward(
 ) -> tuple[torch.Tensor, None]:
     kwargs.pop("softmax_fn", None)
     kwargs.pop("softmax_n_param", None)
-    if attention_mask is not None or dropout > 0 or not query.is_cuda:
+    sliding_window = kwargs.pop("sliding_window", None)
+    if attention_mask is not None or not query.is_cuda:
         return sdpa_attention_forward(
             module,
             query,
@@ -499,6 +695,8 @@ def hopper_softmax1_attention_forward(
         scale=scaling,
         is_causal=is_causal,
         block_n=block_n,
+        window_left=sliding_window,
+        dropout_p=dropout if module.training else 0.0,
     )
     return output.transpose(1, 2).contiguous(), None
 

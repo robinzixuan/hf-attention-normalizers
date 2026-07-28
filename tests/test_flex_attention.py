@@ -7,6 +7,7 @@ from hf_attention_normalizers import set_softmax_attention_backend
 from hf_attention_normalizers.backends import (
     flex_attention_normalizer_forward,
     resolve_softmax_fn,
+    sdpa_attention_forward,
 )
 
 
@@ -50,6 +51,148 @@ class FlexAttentionNormalizerTest(unittest.TestCase):
                 self.assertEqual(output.shape, (1, 16, 2, 32))
                 self.assertTrue(torch.isfinite(output).all())
 
+    def test_sliding_causal_block_mask_uses_native_hopper_path(self):
+        from torch import nn
+        from transformers.masking_utils import (
+            flex_attention_mask,
+            sliding_window_causal_mask_function,
+        )
+
+        class Module(nn.Module):
+            is_causal = True
+            num_key_value_groups = 1
+
+        sequence_length = 16
+        window = 4
+        block_mask = flex_attention_mask(
+            batch_size=1,
+            cache_position=torch.arange(sequence_length, device="cuda"),
+            kv_length=sequence_length,
+            mask_function=sliding_window_causal_mask_function(window),
+            attention_mask=None,
+        )
+        base = [
+            torch.randn(1, 2, sequence_length, 32, device="cuda", dtype=torch.float16)
+            for _ in range(3)
+        ]
+        positions = torch.arange(sequence_length, device="cuda")
+        dense_mask = (
+            (positions[:, None] >= positions[None, :])
+            & (positions[:, None] - positions[None, :] < window)
+        )[None, None]
+
+        for normalizer in ("softmax1", "sparsemax", "entmax15"):
+            with self.subTest(normalizer=normalizer):
+                normalizer_fn = resolve_softmax_fn(normalizer)
+                query, key, value = [
+                    tensor.detach().clone().requires_grad_(True) for tensor in base
+                ]
+                ref_query, ref_key, ref_value = [
+                    tensor.detach().clone().requires_grad_(True) for tensor in base
+                ]
+                with patch(
+                    "hf_attention_normalizers.backends._dense_mask_from_flex_block_mask",
+                    side_effect=AssertionError("dense BlockMask fallback was used"),
+                ):
+                    output, _ = flex_attention_normalizer_forward(
+                        Module(),
+                        query,
+                        key,
+                        value,
+                        block_mask,
+                        softmax_fn=normalizer_fn,
+                        scaling=32**-0.5,
+                    )
+                reference, _ = sdpa_attention_forward(
+                    Module(),
+                    ref_query,
+                    ref_key,
+                    ref_value,
+                    dense_mask,
+                    softmax_fn=normalizer_fn,
+                    scaling=32**-0.5,
+                    is_causal=False,
+                )
+                upstream = torch.randn_like(output)
+                output.backward(upstream)
+                reference.backward(upstream)
+                torch.testing.assert_close(output, reference, atol=0.01, rtol=0.01)
+                for actual, expected in zip(
+                    (query.grad, key.grad, value.grad),
+                    (ref_query.grad, ref_key.grad, ref_value.grad),
+                ):
+                    torch.testing.assert_close(actual, expected, atol=0.012, rtol=0.012)
+
+    def test_right_padded_causal_block_mask_uses_native_hopper_path(self):
+        from torch import nn
+        from transformers.masking_utils import causal_mask_function, flex_attention_mask
+
+        class Module(nn.Module):
+            is_causal = True
+            num_key_value_groups = 1
+
+        sequence_length = 16
+        padding = torch.tensor(
+            [[True] * 16, [True] * 11 + [False] * 5], device="cuda"
+        )
+        block_mask = flex_attention_mask(
+            batch_size=2,
+            cache_position=torch.arange(sequence_length, device="cuda"),
+            kv_length=sequence_length,
+            mask_function=causal_mask_function,
+            attention_mask=padding,
+        )
+        base = [
+            torch.randn(2, 2, sequence_length, 32, device="cuda", dtype=torch.float16)
+            for _ in range(3)
+        ]
+        causal = torch.arange(sequence_length, device="cuda")[:, None] >= torch.arange(
+            sequence_length, device="cuda"
+        )[None, :]
+        dense_mask = causal[None, None] & padding[:, None, None]
+
+        for normalizer in ("softmax1", "sparsemax", "entmax15"):
+            with self.subTest(normalizer=normalizer):
+                normalizer_fn = resolve_softmax_fn(normalizer)
+                query, key, value = [
+                    tensor.detach().clone().requires_grad_(True) for tensor in base
+                ]
+                ref_query, ref_key, ref_value = [
+                    tensor.detach().clone().requires_grad_(True) for tensor in base
+                ]
+                with patch(
+                    "hf_attention_normalizers.backends._dense_mask_from_flex_block_mask",
+                    side_effect=AssertionError("dense BlockMask fallback was used"),
+                ):
+                    output, _ = flex_attention_normalizer_forward(
+                        Module(),
+                        query,
+                        key,
+                        value,
+                        block_mask,
+                        softmax_fn=normalizer_fn,
+                        scaling=32**-0.5,
+                    )
+                reference, _ = sdpa_attention_forward(
+                    Module(),
+                    ref_query,
+                    ref_key,
+                    ref_value,
+                    dense_mask,
+                    softmax_fn=normalizer_fn,
+                    scaling=32**-0.5,
+                    is_causal=False,
+                )
+                upstream = torch.randn_like(output)
+                output.backward(upstream)
+                reference.backward(upstream)
+                torch.testing.assert_close(output, reference, atol=0.01, rtol=0.01)
+                for actual, expected in zip(
+                    (query.grad, key.grad, value.grad),
+                    (ref_query.grad, ref_key.grad, ref_value.grad),
+                ):
+                    torch.testing.assert_close(actual, expected, atol=0.012, rtol=0.012)
+
     def test_qwen3_forward_and_backward(self):
         from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 
@@ -64,6 +207,7 @@ class FlexAttentionNormalizerTest(unittest.TestCase):
                     num_key_value_heads=2,
                     head_dim=16,
                     max_position_embeddings=64,
+                    attention_dropout=0.2,
                 )
                 model = Qwen3ForCausalLM(config).to(
                     device="cuda",

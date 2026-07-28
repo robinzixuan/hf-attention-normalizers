@@ -53,8 +53,9 @@ class VarlenHopperAttentionTest(unittest.TestCase):
                     cu_q,
                     cu_k,
                     normalizer,
-                    max_seqlen_q=5,
-                    max_seqlen_k=7,
+                    # Exercise inactive programs/tiles in the shared varlen grid.
+                    max_seqlen_q=8,
+                    max_seqlen_k=10,
                 )
                 reference = _packed_reference(
                     ref_query,

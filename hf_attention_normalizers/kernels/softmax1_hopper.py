@@ -25,6 +25,7 @@ if triton is not None:
         output,
         row_max,
         row_denominator,
+        seed,
         stride_qb: tl.constexpr,
         stride_qh: tl.constexpr,
         stride_ql: tl.constexpr,
@@ -52,6 +53,9 @@ if triton is not None:
         head_dim: tl.constexpr,
         scale: tl.constexpr,
         is_causal: tl.constexpr,
+        window_left: tl.constexpr,
+        num_heads: tl.constexpr,
+        dropout_p: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
@@ -82,6 +86,8 @@ if triton is not None:
             valid_n = offs_n < key_length
             if is_causal:
                 valid_n = valid_n & (offs_n <= causal_limit)
+            if window_left > 0:
+                valid_n = valid_n & (offs_n > causal_limit - window_left)
             keys = tl.load(
                 key_base + offs_n[:, None] * stride_ks + offs_d[None, :] * stride_kd,
                 mask=valid_n[:, None] & valid_d[None, :],
@@ -96,13 +102,19 @@ if triton is not None:
             previous_scale = tl.exp(running_max - new_max)
             exponentials = tl.exp(scores - new_max)
             exponentials = tl.where(valid_n, exponentials, 0.0)
+            rng_offsets = (
+                ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
+            )
+            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            dropout_scale = 1.0 / (1.0 - dropout_p)
+            dropped_exponentials = exponentials * keep.to(tl.float32) * dropout_scale
             values = tl.load(
                 value_base + offs_n[:, None] * stride_vs + offs_d[None, :] * stride_vd,
                 mask=valid_n[:, None] & valid_d[None, :],
                 other=0.0,
             ).to(tl.float32)
             accumulator = accumulator * previous_scale + tl.sum(
-                exponentials[:, None] * values,
+                dropped_exponentials[:, None] * values,
                 axis=0,
             )
             denominator = denominator * previous_scale + tl.sum(exponentials, axis=0)
@@ -135,6 +147,7 @@ if triton is not None:
         grad_query,
         grad_key,
         grad_value,
+        seed,
         stride_qb: tl.constexpr,
         stride_qh: tl.constexpr,
         stride_ql: tl.constexpr,
@@ -174,6 +187,9 @@ if triton is not None:
         head_dim: tl.constexpr,
         scale: tl.constexpr,
         is_causal: tl.constexpr,
+        window_left: tl.constexpr,
+        num_heads: tl.constexpr,
+        dropout_p: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
@@ -216,6 +232,8 @@ if triton is not None:
             valid_n = offs_n < key_length
             if is_causal:
                 valid_n = valid_n & (offs_n <= causal_limit)
+            if window_left > 0:
+                valid_n = valid_n & (offs_n > causal_limit - window_left)
             keys = tl.load(
                 key_base + offs_n[:, None] * stride_ks + offs_d[None, :] * stride_kd,
                 mask=valid_n[:, None] & valid_d[None, :],
@@ -229,7 +247,13 @@ if triton is not None:
             scores = tl.sum(keys * q[None, :], axis=1) * scale
             probabilities = tl.exp(scores - maximum) / denominator
             probabilities = tl.where(valid_n, probabilities, 0.0)
+            rng_offsets = (
+                ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
+            )
+            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            dropout_scale = 1.0 / (1.0 - dropout_p)
             grad_probabilities = tl.sum(values * grad_out[None, :], axis=1)
+            grad_probabilities *= keep.to(tl.float32) * dropout_scale
             correction += tl.sum(probabilities * grad_probabilities, axis=0)
 
         grad_q = tl.zeros((BLOCK_D,), dtype=tl.float32)
@@ -238,6 +262,8 @@ if triton is not None:
             valid_n = offs_n < key_length
             if is_causal:
                 valid_n = valid_n & (offs_n <= causal_limit)
+            if window_left > 0:
+                valid_n = valid_n & (offs_n > causal_limit - window_left)
             keys = tl.load(
                 key_base + offs_n[:, None] * stride_ks + offs_d[None, :] * stride_kd,
                 mask=valid_n[:, None] & valid_d[None, :],
@@ -251,7 +277,13 @@ if triton is not None:
             scores = tl.sum(keys * q[None, :], axis=1) * scale
             probabilities = tl.exp(scores - maximum) / denominator
             probabilities = tl.where(valid_n, probabilities, 0.0)
+            rng_offsets = (
+                ((pid_b * num_heads + pid_h) * query_length + pid_l) * key_length + offs_n
+            )
+            keep = tl.rand(seed, rng_offsets) >= dropout_p
+            dropout_scale = 1.0 / (1.0 - dropout_p)
             grad_probabilities = tl.sum(values * grad_out[None, :], axis=1)
+            grad_probabilities *= keep.to(tl.float32) * dropout_scale
             grad_scores = probabilities * (grad_probabilities - correction)
             grad_q += tl.sum(grad_scores[:, None] * keys, axis=0) * scale
             tl.atomic_add(
@@ -269,7 +301,7 @@ if triton is not None:
                 + pid_h * stride_dvh
                 + offs_n[:, None] * stride_dvs
                 + offs_d[None, :] * stride_dvd,
-                probabilities[:, None] * grad_out[None, :],
+                probabilities[:, None] * keep[:, None].to(tl.float32) * dropout_scale * grad_out[None, :],
                 mask=valid_n[:, None] & valid_d[None, :],
             )
         tl.store(
@@ -289,7 +321,7 @@ def _next_power_of_2(value: int) -> int:
 
 class _Softmax1HopperAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, scale, is_causal, block_n):
+    def forward(ctx, query, key, value, scale, is_causal, window_left, block_n, dropout_p, seed):
         batch, heads, query_length, head_dim = query.shape
         key_length = key.shape[-2]
         block_d = _next_power_of_2(head_dim)
@@ -306,6 +338,7 @@ class _Softmax1HopperAttention(torch.autograd.Function):
             output,
             row_max,
             row_denominator,
+            seed,
             *query.stride(),
             *key.stride(),
             *value.stride(),
@@ -317,13 +350,19 @@ class _Softmax1HopperAttention(torch.autograd.Function):
             head_dim,
             scale,
             is_causal,
+            window_left,
+            heads,
+            dropout_p,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
         )
         ctx.save_for_backward(query, key, value, row_max, row_denominator)
         ctx.scale = scale
         ctx.is_causal = is_causal
+        ctx.window_left = window_left
         ctx.block_n = block_n
+        ctx.dropout_p = dropout_p
+        ctx.seed = seed
         return output
 
     @staticmethod
@@ -346,6 +385,7 @@ class _Softmax1HopperAttention(torch.autograd.Function):
             grad_query,
             grad_key,
             grad_value,
+            ctx.seed,
             *query.stride(),
             *key.stride(),
             *value.stride(),
@@ -360,10 +400,13 @@ class _Softmax1HopperAttention(torch.autograd.Function):
             head_dim,
             ctx.scale,
             ctx.is_causal,
+            ctx.window_left,
+            heads,
+            ctx.dropout_p,
             BLOCK_N=ctx.block_n,
             BLOCK_D=block_d,
         )
-        return grad_query, grad_key, grad_value, None, None, None
+        return grad_query, grad_key, grad_value, None, None, None, None, None, None
 
 
 def hopper_softmax1_attention(
@@ -372,7 +415,9 @@ def hopper_softmax1_attention(
     value: torch.Tensor,
     scale: Optional[float] = None,
     is_causal: bool = False,
+    window_left: Optional[int] = None,
     block_n: int = 128,
+    dropout_p: float = 0.0,
 ) -> torch.Tensor:
     _require_triton()
     if not query.is_cuda or not key.is_cuda or not value.is_cuda:
@@ -383,12 +428,21 @@ def hopper_softmax1_attention(
         raise ValueError("Q/K/V head dimensions must match.")
     if _next_power_of_2(query.shape[-1]) > 256:
         raise ValueError("head_dim larger than 256 is not supported.")
+    if not 0.0 <= dropout_p < 1.0:
+        raise ValueError("dropout_p must be in [0, 1).")
     actual_scale = query.shape[-1] ** -0.5 if scale is None else scale
+    # This consumes one value from PyTorch's CUDA RNG. Re-seeding PyTorch before
+    # a call therefore reproduces the fused mask; backward recomputes it from
+    # this saved seed instead of retaining a dense [B,H,Q,K] mask.
+    seed = int(torch.empty((), device=query.device, dtype=torch.int64).random_(2**31 - 1).item())
     return _Softmax1HopperAttention.apply(
         query,
         key,
         value,
         actual_scale,
         is_causal,
+        -1 if window_left is None else window_left,
         block_n,
+        dropout_p,
+        seed,
     )
