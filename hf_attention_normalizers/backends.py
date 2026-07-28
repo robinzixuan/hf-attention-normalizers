@@ -932,9 +932,21 @@ def _make_softmax_attention_forward(
         attention_forward = sdpa_attention_forward
     elif base_backend == "flash_attention_2" and is_softmax_n:
         attention_forward = flash_attention_softmax_n_forward
+    elif base_backend == "flash_attention_2" and softmax_name == "sparsemax":
+        # Compatibility name only: FA2 itself hard-codes softmax. Route the
+        # sparse transform to our Hopper Triton kernel instead.
+        attention_forward = hopper_sparsemax_attention_forward
+    elif base_backend == "flash_attention_2" and softmax_name == "entmax15":
+        # Compatibility name only; see the sparsemax case above.
+        attention_forward = hopper_entmax15_attention_forward
     elif base_backend == "flex_attention":
         attention_forward = flex_attention_normalizer_forward
     elif base_backend == "paged_attention" and softmax_name in {"softmax1", "softmax_1", "sparsemax", "entmax15"}:
+        attention_forward = paged_normalizer_attention_forward
+    elif base_backend.startswith("paged|") and softmax_name in {"softmax1", "softmax_1", "sparsemax", "entmax15"}:
+        # HF's composite paged implementations use the same packed cache / cu
+        # seqlen contract as paged_attention. Keep the composite name while
+        # routing custom normalizers to the packed Hopper implementation.
         attention_forward = paged_normalizer_attention_forward
     elif base_backend == "flash_attention_3" and softmax_name == "sparsemax":
         attention_forward = hopper_sparsemax_attention_forward
@@ -1011,7 +1023,14 @@ def register_softmax_attention_backends(
             backend == "flash_attention_3"
             and softmax_name_for_support in {"softmax1", "softmax_1", "softmax_n", "sparsemax", "entmax15"}
         )
-        supported = backend in {"eager", "sdpa", "flex_attention", "paged_attention"} or supports_hopper_kernel or (
+        supports_fa2_compat_hopper = (
+            backend == "flash_attention_2"
+            and softmax_name_for_support in {"sparsemax", "entmax15"}
+        )
+        supports_paged_composite = backend.startswith("paged|") and softmax_name_for_support in {
+            "softmax1", "softmax_1", "softmax_n", "sparsemax", "entmax15"
+        }
+        supported = backend in {"eager", "sdpa", "flex_attention", "paged_attention"} or supports_hopper_kernel or supports_fa2_compat_hopper or supports_paged_composite or (
             backend == "flash_attention_2" and supports_softmax_n_kernel
         )
         if not supported and not include_unsupported:

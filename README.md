@@ -34,13 +34,13 @@ This project has two integration paths:
 | --- | --- | --- | --- |
 | `*_eager` | supported | supported | supported |
 | `*_sdpa` | supported via custom SDPA-like path | supported via custom SDPA-like path | supported via custom SDPA-like path |
-| `softmax1_flash_attention_2` | supported if `flash-attention-softmax-n` is installed | not supported | not supported |
+| `*_flash_attention_2` | native FA2 extension if `flash-attention-softmax-n` is installed | supported as a Hopper-Triton compatibility route | supported as a Hopper-Triton compatibility route |
 | `*_triton` | not used | fused forward and backward | fused forward and backward |
 | `*_flash_attention_3` | custom Hopper online kernel | custom Hopper multi-block kernel | custom Hopper multi-block kernel |
 | `*_flex_attention` | BlockMask compatibility path | BlockMask compatibility path | BlockMask compatibility path |
 | `*_paged|*` | registered only; strict mode raises | registered only; strict mode raises | registered only; strict mode raises |
 
-`flash-attention-softmax-n` implements Softmax-N kernels. It cannot be reused for `sparsemax` or `entmax15`, because those transforms have different normalization math and would need their own kernels.
+`flash-attention-softmax-n` implements the native FA2 Softmax-N kernel. FA2 itself cannot express sparsemax/entmax15; their `*_flash_attention_2` names are HuggingFace-compatible aliases that route to the custom Hopper Triton kernels, not to official FA2 CUDA.
 
 ## Install
 
