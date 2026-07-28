@@ -297,7 +297,11 @@ def paged_triton_attention(
         "page_size": block_size,
         "scale": scale,
         "is_causal": is_causal,
-        "block_n": min(128, max_block_n),
+        # H100 measurements for the direct physical-page kernels show that a
+        # 256-token K tile reduces loop/control overhead for both normalizers
+        # at practical decode/prefill lengths. Callers can still cap it for
+        # very small heads or constrained kernels through ``max_block_n``.
+        "block_n": min(256, max_block_n),
     }
     if normalizer in {"softmax1", "softmax_1"}:
         return paged_hopper_softmax1_attention(**common_kwargs)
