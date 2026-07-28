@@ -229,7 +229,7 @@ output = paged_attention(
 )
 ```
 
-The CUDA Triton path supports sparsemax and entmax15 with fused attention
+The CUDA Triton path supports Softmax1, sparsemax, and entmax15 with fused attention
 forward/backward, variable sequence lengths, GQA, and physical-page gradient
 accumulation:
 
@@ -243,7 +243,7 @@ output = paged_triton_attention(
     block_table,
     sequence_lengths,
     block_size=32,
-    normalizer="entmax15",
+    normalizer="entmax15",  # or "softmax1" / "sparsemax"
 )
 ```
 

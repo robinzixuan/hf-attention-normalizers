@@ -88,7 +88,7 @@ class PagedAttentionTest(unittest.TestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "Paged Triton tests require CUDA")
 class PagedTritonAttentionTest(unittest.TestCase):
     def test_variable_length_forward_and_cache_scatter_backward(self):
-        for normalizer in ("sparsemax", "entmax15"):
+        for normalizer in ("softmax1", "sparsemax", "entmax15"):
             with self.subTest(normalizer=normalizer):
                 torch.manual_seed(23)
                 query = torch.randn(

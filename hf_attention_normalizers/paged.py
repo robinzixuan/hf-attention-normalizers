@@ -5,6 +5,7 @@ from transformers.cache_utils import Cache, CacheLayerMixin
 
 from .backends import resolve_softmax_fn
 from .kernels.paged_sparse_entmax_hopper import paged_hopper_sparse_attention
+from .kernels.paged_softmax1_hopper import paged_hopper_softmax1_attention
 
 
 class DifferentiablePagedCacheLayer(CacheLayerMixin):
@@ -267,8 +268,10 @@ def paged_triton_attention(
     attention matrix is never materialized. Gather backward accumulates K/V
     gradients into their original physical cache pages.
     """
-    if normalizer not in {"sparsemax", "entmax15"}:
-        raise ValueError("paged_triton_attention supports 'sparsemax' or 'entmax15'.")
+    if normalizer not in {"softmax1", "softmax_1", "sparsemax", "entmax15"}:
+        raise ValueError(
+            "paged_triton_attention supports 'softmax1', 'sparsemax', or 'entmax15'."
+        )
     if not query.is_cuda or not key_cache.is_cuda or not value_cache.is_cuda:
         raise ValueError("paged_triton_attention requires CUDA tensors.")
     if query.ndim != 4:
@@ -285,15 +288,17 @@ def paged_triton_attention(
     physical_indices, _ = paged_cache_indices(block_table, sequence_lengths, block_size)
     if int(physical_indices.max().item()) >= key_cache.shape[0]:
         raise ValueError("block_table references a block outside the physical cache.")
-    return paged_hopper_sparse_attention(
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        sequence_lengths,
-        page_size=block_size,
-        normalizer=normalizer,
-        scale=scale,
-        is_causal=is_causal,
-        block_n=min(128, max_block_n),
-    )
+    common_kwargs = {
+        "query": query,
+        "key_cache": key_cache,
+        "value_cache": value_cache,
+        "block_table": block_table,
+        "sequence_lengths": sequence_lengths,
+        "page_size": block_size,
+        "scale": scale,
+        "is_causal": is_causal,
+        "block_n": min(128, max_block_n),
+    }
+    if normalizer in {"softmax1", "softmax_1"}:
+        return paged_hopper_softmax1_attention(**common_kwargs)
+    return paged_hopper_sparse_attention(**common_kwargs, normalizer=normalizer)
