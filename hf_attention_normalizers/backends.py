@@ -205,6 +205,34 @@ def _dense_mask_from_flex_block_mask(
     return dense & element_mask
 
 
+def _is_pure_causal_flex_mask(block_mask) -> bool:
+    """Conservatively recognize HF's offset-wrapped causal mask function."""
+    try:
+        from transformers.masking_utils import causal_mask_function
+    except ImportError:
+        return False
+
+    def unwrap(function, seen):
+        if function is causal_mask_function:
+            return True
+        if id(function) in seen:
+            return False
+        seen.add(id(function))
+        closure = getattr(function, "__closure__", None)
+        if not closure:
+            return False
+        nested_functions = [
+            cell.cell_contents
+            for cell in closure
+            if callable(cell.cell_contents)
+        ]
+        # Offset wrappers contain exactly one nested mask function. Combined
+        # padding/custom masks contain multiple functions and must fall back.
+        return len(nested_functions) == 1 and unwrap(nested_functions[0], seen)
+
+    return unwrap(block_mask.mask_mod, set())
+
+
 def flex_attention_normalizer_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -220,6 +248,24 @@ def flex_attention_normalizer_forward(
         from torch.nn.attention.flex_attention import BlockMask
     except ImportError:
         BlockMask = ()  # type: ignore[assignment]
+
+    if isinstance(attention_mask, BlockMask) and _is_pure_causal_flex_mask(attention_mask):
+        common_kwargs = {
+            "module": module,
+            "query": query,
+            "key": key,
+            "value": value,
+            "attention_mask": None,
+            "dropout": dropout,
+            "scaling": scaling,
+            "is_causal": True,
+        }
+        if softmax_fn is softmax_1:
+            return hopper_softmax1_attention_forward(**common_kwargs, **kwargs)
+        if softmax_fn is sparsemax:
+            return hopper_sparsemax_attention_forward(**common_kwargs, **kwargs)
+        if softmax_fn is entmax15:
+            return hopper_entmax15_attention_forward(**common_kwargs, **kwargs)
 
     if isinstance(attention_mask, BlockMask):
         attention_mask = _dense_mask_from_flex_block_mask(
