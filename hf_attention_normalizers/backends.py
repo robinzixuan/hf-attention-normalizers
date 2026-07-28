@@ -143,10 +143,18 @@ def flash_attention_softmax_n_forward(
             "Install it with: pip install flash-attention-softmax-n"
         ) from exc
 
-    if hasattr(module, "num_key_value_groups"):
-        if not use_gqa_in_sdpa(attention_mask, key):
-            key = repeat_kv(key, module.num_key_value_groups)
-            value = repeat_kv(value, module.num_key_value_groups)
+    if key.size(-3) != query.size(-3):
+        if query.size(-3) % key.size(-3) != 0:
+            raise ValueError(
+                "FlashAttention requires the number of query heads to be divisible by "
+                f"the number of key/value heads. Got {query.size(-3)} query heads and "
+                f"{key.size(-3)} key/value heads."
+            )
+        # flash-attention-softmax-n does not implement PyTorch SDPA's
+        # enable_gqa behavior, so expand grouped K/V heads explicitly.
+        num_key_value_groups = query.size(-3) // key.size(-3)
+        key = repeat_kv(key, num_key_value_groups)
+        value = repeat_kv(value, num_key_value_groups)
 
     if attention_mask is not None and attention_mask.ndim == 4:
         attention_mask = attention_mask[:, :, :, : key.shape[-2]]
@@ -170,6 +178,69 @@ def flash_attention_softmax_n_forward(
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, None
+
+
+def _dense_mask_from_flex_block_mask(
+    block_mask,
+    query_length: int,
+    key_length: int,
+    batch_size: int,
+    num_heads: int,
+) -> torch.Tensor:
+    block_dense = block_mask.to_dense().to(torch.bool)
+    query_blocks, key_blocks = block_dense.shape[-2:]
+    query_block_size = (query_length + query_blocks - 1) // query_blocks
+    key_block_size = (key_length + key_blocks - 1) // key_blocks
+    dense = block_dense.repeat_interleave(query_block_size, dim=-2).repeat_interleave(
+        key_block_size,
+        dim=-1,
+    )[..., :query_length, :key_length]
+    dense = dense.expand(batch_size, num_heads, query_length, key_length)
+
+    batch = torch.arange(batch_size, device=dense.device)[:, None, None, None]
+    head = torch.arange(num_heads, device=dense.device)[None, :, None, None]
+    query_index = torch.arange(query_length, device=dense.device)[None, None, :, None]
+    key_index = torch.arange(key_length, device=dense.device)[None, None, None, :]
+    element_mask = block_mask.mask_mod(batch, head, query_index, key_index)
+    return dense & element_mask
+
+
+def flex_attention_normalizer_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask,
+    softmax_fn: Callable[..., torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    try:
+        from torch.nn.attention.flex_attention import BlockMask
+    except ImportError:
+        BlockMask = ()  # type: ignore[assignment]
+
+    if isinstance(attention_mask, BlockMask):
+        attention_mask = _dense_mask_from_flex_block_mask(
+            attention_mask,
+            query.shape[-2],
+            key.shape[-2],
+            query.shape[0],
+            query.shape[1],
+        )
+    return sdpa_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        softmax_fn=softmax_fn,
+        dropout=dropout,
+        scaling=scaling,
+        is_causal=False if attention_mask is not None else kwargs.pop("is_causal", None),
+        **kwargs,
+    )
 
 
 def triton_sparsemax_attention_forward(
@@ -272,6 +343,120 @@ def triton_entmax15_attention_forward(
     return attn_output, None
 
 
+def _hopper_sparse_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    normalizer: str,
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    block_n: int = 128,
+    bisection_steps: int = 24,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    kwargs.pop("softmax_fn", None)
+    kwargs.pop("softmax_n_param", None)
+    normalizer_fn = sparsemax if normalizer == "sparsemax" else entmax15
+    if attention_mask is not None or dropout > 0 or not query.is_cuda:
+        return sdpa_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            softmax_fn=normalizer_fn,
+            dropout=dropout,
+            scaling=scaling,
+            is_causal=is_causal,
+            **kwargs,
+        )
+
+    from .kernels.sparse_entmax_hopper import (
+        hopper_entmax15_attention,
+        hopper_sparsemax_attention,
+    )
+
+    if key.shape[-3] != query.shape[-3]:
+        if query.shape[-3] % key.shape[-3] != 0:
+            raise ValueError("Query heads must be divisible by key/value heads.")
+        groups = query.shape[-3] // key.shape[-3]
+        key = repeat_kv(key, groups)
+        value = repeat_kv(value, groups)
+    if is_causal is None:
+        is_causal = query.shape[-2] > 1 and getattr(module, "is_causal", True)
+    kernel = hopper_sparsemax_attention if normalizer == "sparsemax" else hopper_entmax15_attention
+    output = kernel(
+        query,
+        key,
+        value,
+        scale=scaling,
+        is_causal=is_causal,
+        block_n=block_n,
+        bisection_steps=bisection_steps,
+    )
+    return output.transpose(1, 2).contiguous(), None
+
+
+def hopper_sparsemax_attention_forward(*args, **kwargs) -> tuple[torch.Tensor, None]:
+    return _hopper_sparse_attention_forward(*args, normalizer="sparsemax", **kwargs)
+
+
+def hopper_entmax15_attention_forward(*args, **kwargs) -> tuple[torch.Tensor, None]:
+    return _hopper_sparse_attention_forward(*args, normalizer="entmax15", **kwargs)
+
+
+def hopper_softmax1_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    block_n: int = 128,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    kwargs.pop("softmax_fn", None)
+    kwargs.pop("softmax_n_param", None)
+    if attention_mask is not None or dropout > 0 or not query.is_cuda:
+        return sdpa_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            softmax_fn=softmax_1,
+            dropout=dropout,
+            scaling=scaling,
+            is_causal=is_causal,
+            **kwargs,
+        )
+
+    from .kernels.softmax1_hopper import hopper_softmax1_attention
+
+    if key.shape[-3] != query.shape[-3]:
+        if query.shape[-3] % key.shape[-3] != 0:
+            raise ValueError("Query heads must be divisible by key/value heads.")
+        groups = query.shape[-3] // key.shape[-3]
+        key = repeat_kv(key, groups)
+        value = repeat_kv(value, groups)
+    if is_causal is None:
+        is_causal = query.shape[-2] > 1 and getattr(module, "is_causal", True)
+    output = hopper_softmax1_attention(
+        query,
+        key,
+        value,
+        scale=scaling,
+        is_causal=is_causal,
+        block_n=block_n,
+    )
+    return output.transpose(1, 2).contiguous(), None
+
+
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -307,6 +492,10 @@ CUSTOM_ATTENTION_FUNCTIONS: dict[str, Callable[..., tuple[torch.Tensor, Optional
     "softmaxn_eager": eager_attention_forward,
     "softmaxn_sdpa": sdpa_attention_forward,
     "softmaxn_flash_attention_2": flash_attention_softmax_n_forward,
+    "flex_attention": flex_attention_normalizer_forward,
+    "sparsemax_flash_attention_3": hopper_sparsemax_attention_forward,
+    "entmax15_flash_attention_3": hopper_entmax15_attention_forward,
+    "softmax1_flash_attention_3": hopper_softmax1_attention_forward,
 }
 
 
@@ -340,6 +529,14 @@ def _make_softmax_attention_forward(
         attention_forward = sdpa_attention_forward
     elif base_backend == "flash_attention_2" and is_softmax_n:
         attention_forward = flash_attention_softmax_n_forward
+    elif base_backend == "flex_attention":
+        attention_forward = flex_attention_normalizer_forward
+    elif base_backend == "flash_attention_3" and softmax_name == "sparsemax":
+        attention_forward = hopper_sparsemax_attention_forward
+    elif base_backend == "flash_attention_3" and softmax_name == "entmax15":
+        attention_forward = hopper_entmax15_attention_forward
+    elif base_backend == "flash_attention_3" and is_softmax_n:
+        attention_forward = hopper_softmax1_attention_forward
     elif mode == "fallback":
         attention_forward = CUSTOM_ATTENTION_FUNCTIONS[fallback_backend]
     elif mode == "strict":
@@ -405,7 +602,13 @@ def register_softmax_attention_backends(
             softmax_fn if isinstance(softmax_fn, str) else getattr(softmax_fn, "__name__", "custom")
         )
         supports_softmax_n_kernel = softmax_name_for_support in {"softmax1", "softmax_1", "softmax_n"}
-        supported = backend in {"eager", "sdpa"} or (backend == "flash_attention_2" and supports_softmax_n_kernel)
+        supports_hopper_kernel = (
+            backend == "flash_attention_3"
+            and softmax_name_for_support in {"softmax1", "softmax_1", "softmax_n", "sparsemax", "entmax15"}
+        )
+        supported = backend in {"eager", "sdpa", "flex_attention"} or supports_hopper_kernel or (
+            backend == "flash_attention_2" and supports_softmax_n_kernel
+        )
         if not supported and not include_unsupported:
             continue
 
@@ -424,9 +627,10 @@ def register_softmax_attention_backends(
 
         try:
             from transformers import AttentionMaskInterface
-            from transformers.masking_utils import sdpa_mask
+            from transformers.masking_utils import flex_attention_mask, sdpa_mask
 
-            AttentionMaskInterface.register(name, sdpa_mask)
+            mask_function = flex_attention_mask if backend == "flex_attention" else sdpa_mask
+            AttentionMaskInterface.register(name, mask_function)
         except (ImportError, AttributeError):
             pass
 
@@ -441,9 +645,10 @@ def _register_attention_backend(name: str, attention_forward: Callable[..., tupl
 
     try:
         from transformers import AttentionMaskInterface
-        from transformers.masking_utils import sdpa_mask
+        from transformers.masking_utils import flex_attention_mask, sdpa_mask
 
-        AttentionMaskInterface.register(name, sdpa_mask)
+        mask_function = flex_attention_mask if "flex_attention" in name else sdpa_mask
+        AttentionMaskInterface.register(name, mask_function)
     except (ImportError, AttributeError):
         pass
 

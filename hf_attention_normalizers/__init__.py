@@ -19,6 +19,13 @@ from .backends import (
     triton_entmax15_attention_forward,
     triton_sparsemax_attention_forward,
 )
+from .paged import (
+    DifferentiablePagedCache,
+    DifferentiablePagedCacheLayer,
+    paged_attention,
+    paged_cache_indices,
+    paged_triton_attention,
+)
 
 __all__ = [
     "AttentionReplacementPolicy",
@@ -40,4 +47,9 @@ __all__ = [
     "supported_attention_policies",
     "triton_entmax15_attention_forward",
     "triton_sparsemax_attention_forward",
+    "paged_attention",
+    "paged_cache_indices",
+    "paged_triton_attention",
+    "DifferentiablePagedCache",
+    "DifferentiablePagedCacheLayer",
 ]
