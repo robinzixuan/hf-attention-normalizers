@@ -326,6 +326,86 @@ def _right_padded_lengths_from_flex_mask(block_mask) -> Optional[torch.Tensor]:
     return lengths
 
 
+def _block_csr_flex_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_mask,
+    softmax_fn: Callable[..., torch.Tensor],
+    scale: Optional[float],
+) -> Optional[torch.Tensor]:
+    """Exact block-CSR Flex path for masks without element-level filtering.
+
+    This avoids ``BlockMask.to_dense()`` entirely. It intentionally targets
+    masks created from explicit full KV blocks (`mask_mod=noop_mask`); a custom
+    element mask can make a listed block only partially valid and must use the
+    dense compatibility fallback until the Triton CSR kernel is in place.
+    """
+    try:
+        from torch.nn.attention.flex_attention import noop_mask
+    except ImportError:
+        return None
+    if block_mask.mask_mod is not noop_mask:
+        return None
+    if key.shape[-3] != query.shape[-3]:
+        if query.shape[-3] % key.shape[-3] != 0:
+            raise ValueError("Query heads must be divisible by key/value heads.")
+        groups = query.shape[-3] // key.shape[-3]
+        key = repeat_kv(key, groups)
+        value = repeat_kv(value, groups)
+    batch_size, heads, query_length, head_dim = query.shape
+    q_block_size, kv_block_size = block_mask.BLOCK_SIZE
+    num_blocks = block_mask.kv_num_blocks
+    block_indices = block_mask.kv_indices
+    if num_blocks.ndim != 3 or block_indices.ndim != 4:
+        return None
+    if num_blocks.shape[0] not in {1, batch_size} or num_blocks.shape[1] not in {1, heads}:
+        return None
+    actual_scale = head_dim**-0.5 if scale is None else scale
+    if softmax_fn is softmax_1:
+        from .kernels.block_csr_softmax1_triton import block_csr_softmax1_attention
+
+        csr_num_blocks = num_blocks.expand(batch_size, heads, -1)
+        csr_block_indices = block_indices.expand(batch_size, heads, -1, -1)
+        return block_csr_softmax1_attention(
+            query,
+            key,
+            value,
+            csr_num_blocks,
+            csr_block_indices,
+            q_block_size,
+            kv_block_size,
+            actual_scale,
+        )
+    output = torch.empty_like(query)
+    for batch_index in range(batch_size):
+        mask_batch = 0 if num_blocks.shape[0] == 1 else batch_index
+        for head_index in range(heads):
+            mask_head = 0 if num_blocks.shape[1] == 1 else head_index
+            for q_block in range(num_blocks.shape[2]):
+                q_start = q_block * q_block_size
+                q_end = min(q_start + q_block_size, query_length)
+                if q_start >= q_end:
+                    continue
+                count = int(num_blocks[mask_batch, mask_head, q_block].item())
+                if count == 0:
+                    # Match the dense path's all-masked behavior without
+                    # constructing a full mask or an attention score matrix.
+                    output[batch_index, head_index, q_start:q_end] = 0
+                    continue
+                selected_blocks = block_indices[mask_batch, mask_head, q_block, :count]
+                offsets = torch.arange(kv_block_size, device=query.device)
+                key_positions = (selected_blocks[:, None] * kv_block_size + offsets).reshape(-1)
+                key_positions = key_positions[key_positions < key.shape[-2]]
+                q_tile = query[batch_index, head_index, q_start:q_end]
+                k_tile = key[batch_index, head_index, key_positions]
+                v_tile = value[batch_index, head_index, key_positions]
+                scores = torch.matmul(q_tile, k_tile.transpose(-2, -1)) * actual_scale
+                probabilities = softmax_fn(scores, dim=-1)
+                output[batch_index, head_index, q_start:q_end] = torch.matmul(probabilities, v_tile)
+    return output
+
+
 def _hopper_right_padded_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -458,6 +538,13 @@ def flex_attention_normalizer_forward(
             return hopper_sparsemax_attention_forward(**common_kwargs, **kwargs)
         if softmax_fn is entmax15:
             return hopper_entmax15_attention_forward(**common_kwargs, **kwargs)
+
+    if isinstance(attention_mask, BlockMask):
+        output = _block_csr_flex_attention(
+            query, key, value, attention_mask, softmax_fn, scaling
+        )
+        if output is not None:
+            return output.transpose(1, 2).contiguous(), None
 
     if isinstance(attention_mask, BlockMask):
         attention_mask = _dense_mask_from_flex_block_mask(
