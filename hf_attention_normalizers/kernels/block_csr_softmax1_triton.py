@@ -42,13 +42,15 @@ if triton is not None:
 
     @triton.jit
     def _forward(
-        query, key, value, num_blocks, block_indices, output,
+        query, key, value, num_blocks, block_indices, output, row_max, row_denominator,
         sqb: tl.constexpr, sqh: tl.constexpr, sql: tl.constexpr, sqd: tl.constexpr,
         skb: tl.constexpr, skh: tl.constexpr, skl: tl.constexpr, skd: tl.constexpr,
         svb: tl.constexpr, svh: tl.constexpr, svl: tl.constexpr, svd: tl.constexpr,
         snb: tl.constexpr, snh: tl.constexpr, snq: tl.constexpr,
         sib: tl.constexpr, sih: tl.constexpr, siq: tl.constexpr, sis: tl.constexpr,
         sob: tl.constexpr, soh: tl.constexpr, sol: tl.constexpr, sod: tl.constexpr,
+        smb: tl.constexpr, smh: tl.constexpr, sml: tl.constexpr,
+        slb: tl.constexpr, slh: tl.constexpr, sll: tl.constexpr,
         query_length: tl.constexpr, key_length: tl.constexpr, head_dim: tl.constexpr,
         scale: tl.constexpr, Q_BLOCK: tl.constexpr, KV_BLOCK: tl.constexpr,
         MAX_BLOCKS: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -76,6 +78,8 @@ if triton is not None:
             denominator = denominator * old + tl.sum(weights, axis=0)
             running_max = new_max
         tl.store(output + batch * sob + head * soh + query_index * sol + d * sod, acc / denominator, mask=valid_d)
+        tl.store(row_max + batch * smb + head * smh + query_index * sml, running_max)
+        tl.store(row_denominator + batch * slb + head * slh + query_index * sll, denominator)
 
 
 class _BlockCSRSoftmax1(torch.autograd.Function):
@@ -84,20 +88,22 @@ class _BlockCSRSoftmax1(torch.autograd.Function):
         if triton is None:
             raise ImportError("Block CSR Softmax1 requires Triton.")
         output = torch.empty_like(query)
+        row_max = torch.empty(query.shape[:-1], device=query.device, dtype=torch.float32)
+        row_denominator = torch.empty_like(row_max)
         block_d = _next_power_of_2(query.shape[-1])
         _forward[(query.shape[0], query.shape[1], query.shape[-2])](
-            query, key, value, num_blocks, block_indices, output,
-            *query.stride(), *key.stride(), *value.stride(), *num_blocks.stride(), *block_indices.stride(), *output.stride(),
+            query, key, value, num_blocks, block_indices, output, row_max, row_denominator,
+            *query.stride(), *key.stride(), *value.stride(), *num_blocks.stride(), *block_indices.stride(), *output.stride(), *row_max.stride(), *row_denominator.stride(),
             query.shape[-2], key.shape[-2], query.shape[-1], scale, q_block, kv_block,
             MAX_BLOCKS=block_indices.shape[-1], BLOCK_D=block_d,
         )
-        ctx.save_for_backward(query, key, value, num_blocks, block_indices)
+        ctx.save_for_backward(query, key, value, num_blocks, block_indices, row_max, row_denominator)
         ctx.args = (q_block, kv_block, scale)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        query, key, value, num_blocks, block_indices = ctx.saved_tensors
+        query, key, value, num_blocks, block_indices, row_max, row_denominator = ctx.saved_tensors
         q_block, kv_block, scale = ctx.args
         with torch.enable_grad():
             q = query.detach().requires_grad_(True)
