@@ -247,10 +247,10 @@ output = paged_triton_attention(
 )
 ```
 
-The current Triton implementation gathers each request's physical K/V pages
-before launching its fused variable-length attention kernel. It does not
-materialize the quadratic attention matrix, but direct block-table loads inside
-the kernel are still pending.
+The Triton implementation reads physical K/V pages directly through the
+`block_table`; it does not materialize gathered K/V tensors or the quadratic
+attention matrix. Backward atomically accumulates K/V gradients directly into
+their physical cache pages.
 
 For incremental HuggingFace training, `DifferentiablePagedCache` uses
 functional page writes so gradients remain connected across cache updates:

@@ -4,10 +4,7 @@ import torch
 from transformers.cache_utils import Cache, CacheLayerMixin
 
 from .backends import resolve_softmax_fn
-from .kernels.sparse_entmax_triton import (
-    triton_entmax15_attention,
-    triton_sparsemax_attention,
-)
+from .kernels.paged_sparse_entmax_hopper import paged_hopper_sparse_attention
 
 
 class DifferentiablePagedCacheLayer(CacheLayerMixin):
@@ -270,11 +267,7 @@ def paged_triton_attention(
     attention matrix is never materialized. Gather backward accumulates K/V
     gradients into their original physical cache pages.
     """
-    if normalizer == "sparsemax":
-        kernel = triton_sparsemax_attention
-    elif normalizer == "entmax15":
-        kernel = triton_entmax15_attention
-    else:
+    if normalizer not in {"sparsemax", "entmax15"}:
         raise ValueError("paged_triton_attention supports 'sparsemax' or 'entmax15'.")
     if not query.is_cuda or not key_cache.is_cuda or not value_cache.is_cuda:
         raise ValueError("paged_triton_attention requires CUDA tensors.")
@@ -289,31 +282,18 @@ def paged_triton_attention(
     if query.shape[1] % key_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads.")
 
-    physical_indices, _ = paged_cache_indices(
-        block_table,
-        sequence_lengths,
-        block_size,
-    )
+    physical_indices, _ = paged_cache_indices(block_table, sequence_lengths, block_size)
     if int(physical_indices.max().item()) >= key_cache.shape[0]:
         raise ValueError("block_table references a block outside the physical cache.")
-
-    groups = query.shape[1] // key_cache.shape[1]
-    outputs = []
-    for batch_index, sequence_length in enumerate(sequence_lengths.tolist()):
-        indices = physical_indices[batch_index, :sequence_length]
-        key = key_cache[indices].transpose(0, 1).unsqueeze(0)
-        value = value_cache[indices].transpose(0, 1).unsqueeze(0)
-        if groups != 1:
-            key = key.repeat_interleave(groups, dim=1)
-            value = value.repeat_interleave(groups, dim=1)
-        outputs.append(
-            kernel(
-                query[batch_index : batch_index + 1],
-                key,
-                value,
-                scale=scale,
-                is_causal=is_causal,
-                max_block_n=max_block_n,
-            )
-        )
-    return torch.cat(outputs, dim=0)
+    return paged_hopper_sparse_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        sequence_lengths,
+        page_size=block_size,
+        normalizer=normalizer,
+        scale=scale,
+        is_causal=is_causal,
+        block_n=min(128, max_block_n),
+    )
